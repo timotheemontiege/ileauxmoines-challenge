@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python C:\\\\Users\\\\monti\\\\AppData\\\\Local\\\\Temp\\\\validate_tour.py)"
+    ]
+  }
+}
