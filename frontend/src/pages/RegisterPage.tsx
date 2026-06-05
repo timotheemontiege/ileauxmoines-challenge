@@ -23,20 +23,15 @@ export default function RegisterPage() {
     setError(null);
 
     const cleanUsername = username.trim();
-    if (!/^[a-zA-Z0-9_-]{3,24}$/.test(cleanUsername)) {
-      setError(
-        'Pseudo invalide : 3 à 24 caractères (lettres, chiffres, tiret, underscore).',
-      );
-      return;
-    }
-    if (password.length < 6) {
-      setError('Le mot de passe doit faire au moins 6 caractères.');
+    if (!cleanUsername) {
+      setError('Le pseudo ne peut pas être vide.');
       return;
     }
 
     setLoading(true);
     try {
       await signUp(email, password, cleanUsername);
+      // Pas de confirmation e-mail : on affiche juste un message succès.
       setSubmitted(true);
     } catch (err) {
       setError((err as Error).message);
@@ -51,11 +46,10 @@ export default function RegisterPage() {
         <div className="text-5xl">⛵</div>
         <h1 className="mt-4 text-2xl font-bold">Compte créé !</h1>
         <p className="mt-2 text-slate-400">
-          Si la confirmation par e-mail est activée sur le projet, validez votre
-          adresse avant de vous connecter.
+          Tu peux maintenant te connecter et soumettre tes premières traces.
         </p>
         <Link to="/login" className="btn-primary mt-6">
-          Aller à la connexion
+          Se connecter
         </Link>
       </div>
     );
