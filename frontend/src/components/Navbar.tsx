@@ -23,9 +23,9 @@ export default function Navbar() {
         <Link to="/" className="flex items-center gap-2 font-black tracking-tight">
           <img src="/sail.svg" alt="" className="h-8 w-8" />
           <span className="hidden sm:inline">
-            Île-aux-Moines <span className="text-ocean-400">Challenge</span>
+            Tour Île <span className="text-ocean-400">Challenge</span>
           </span>
-          <span className="sm:hidden text-ocean-400">IAM</span>
+          <span className="sm:hidden text-ocean-400">TIC</span>
         </Link>
 
         <div className="flex items-center gap-1">

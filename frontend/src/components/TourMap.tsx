@@ -4,12 +4,13 @@ import {
   TileLayer,
   Polyline,
   CircleMarker,
+  Circle,
   Tooltip,
   useMap,
 } from 'react-leaflet';
 import L from 'leaflet';
 
-/** Centroïde de l'Île-aux-Moines (point de référence du winding number). */
+/** Centroïde de l'Île-aux-Moines (centre par défaut). */
 export const ISLAND_CENTER: [number, number] = [47.5975, -2.8433];
 
 export interface MapTrace {
@@ -19,23 +20,46 @@ export interface MapTrace {
   label?: string;
 }
 
+export interface MapWaypoint {
+  id: string;
+  name: string;
+  lat: number;
+  lon: number;
+  radiusMeters: number;
+}
+
 interface Props {
   traces: MapTrace[];
   height?: number | string;
   zoom?: number;
   fit?: boolean;
+  center?: [number, number];
+  centerLabel?: string;
+  waypoints?: MapWaypoint[];
+  showWaypointRadius?: boolean;
 }
 
-/** Ajuste la vue pour englober toutes les traces affichées. */
-function FitBounds({ traces, fit }: { traces: MapTrace[]; fit: boolean }) {
+/** Ajuste la vue pour englober traces + waypoints affichés. */
+function FitBounds({
+  traces,
+  waypoints,
+  fit,
+}: {
+  traces: MapTrace[];
+  waypoints: MapWaypoint[];
+  fit: boolean;
+}) {
   const map = useMap();
   useEffect(() => {
     if (!fit) return;
-    const all = traces.flatMap((t) => t.positions);
+    const all: [number, number][] = [
+      ...traces.flatMap((t) => t.positions),
+      ...waypoints.map((w) => [w.lat, w.lon] as [number, number]),
+    ];
     if (all.length === 0) return;
     const bounds = L.latLngBounds(all as L.LatLngTuple[]);
-    if (bounds.isValid()) map.fitBounds(bounds, { padding: [24, 24] });
-  }, [traces, fit, map]);
+    if (bounds.isValid()) map.fitBounds(bounds, { padding: [28, 28] });
+  }, [traces, waypoints, fit, map]);
   return null;
 }
 
@@ -44,6 +68,10 @@ export default function TourMap({
   height = 420,
   zoom = 13,
   fit = true,
+  center = ISLAND_CENTER,
+  centerLabel = 'Centre du parcours',
+  waypoints = [],
+  showWaypointRadius = false,
 }: Props) {
   return (
     <div
@@ -51,7 +79,7 @@ export default function TourMap({
       style={{ height }}
     >
       <MapContainer
-        center={ISLAND_CENTER}
+        center={center}
         zoom={zoom}
         scrollWheelZoom={false}
         style={{ height: '100%', width: '100%' }}
@@ -62,12 +90,40 @@ export default function TourMap({
         />
 
         <CircleMarker
-          center={ISLAND_CENTER}
+          center={center}
           radius={5}
           pathOptions={{ color: '#f8fafc', fillColor: '#f8fafc', fillOpacity: 1 }}
         >
-          <Tooltip>Île-aux-Moines</Tooltip>
+          <Tooltip>{centerLabel}</Tooltip>
         </CircleMarker>
+
+        {/* Waypoints (bornes de secteur / points de passage) + rayon de validation */}
+        {waypoints.map((w, i) => (
+          <CircleMarker
+            key={w.id}
+            center={[w.lat, w.lon]}
+            radius={6}
+            pathOptions={{ color: '#38bdf8', fillColor: '#0ea5e9', fillOpacity: 0.9 }}
+          >
+            <Tooltip>
+              {i + 1}. {w.name}
+            </Tooltip>
+          </CircleMarker>
+        ))}
+        {showWaypointRadius &&
+          waypoints.map((w) => (
+            <Circle
+              key={`r-${w.id}`}
+              center={[w.lat, w.lon]}
+              radius={w.radiusMeters}
+              pathOptions={{
+                color: '#38bdf8',
+                weight: 1,
+                fillColor: '#38bdf8',
+                fillOpacity: 0.08,
+              }}
+            />
+          ))}
 
         {traces.map((trace) => (
           <Polyline
@@ -79,7 +135,7 @@ export default function TourMap({
           </Polyline>
         ))}
 
-        <FitBounds traces={traces} fit={fit} />
+        <FitBounds traces={traces} waypoints={waypoints} fit={fit} />
       </MapContainer>
     </div>
   );

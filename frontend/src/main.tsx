@@ -5,12 +5,15 @@ import 'leaflet/dist/leaflet.css';
 import './index.css';
 import App from './App';
 import { AuthProvider } from './hooks/useAuth';
+import { CourseProvider } from './hooks/useCourse';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <BrowserRouter>
       <AuthProvider>
-        <App />
+        <CourseProvider>
+          <App />
+        </CourseProvider>
       </AuthProvider>
     </BrowserRouter>
   </React.StrictMode>,

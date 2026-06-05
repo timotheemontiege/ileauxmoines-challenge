@@ -1,12 +1,12 @@
-// POST /api/sessions/upload — upload d'un GPX + analyse + enregistrement.
+// POST /api/sessions/upload — upload d'un GPX + analyse multi-parcours + enregistrement.
 import { Router } from 'express';
 import multer from 'multer';
 import { randomUUID } from 'node:crypto';
 import { requireAuth } from '../lib/auth.js';
 import { supabaseAdmin, isSupabaseConfigured, GPX_BUCKET } from '../lib/supabase.js';
 import { parseGpx } from '../core/gpxParser.js';
-import { analyzeTrack } from '../core/tourDetector.js';
-import { CATEGORIES } from '../core/constants.js';
+import { detectTour, estimateSampleIntervalSeconds } from '../core/tourDetector.js';
+import { getCourse, isValidCourseId, DEFAULT_COURSE_ID } from '../config/courses.js';
 import { formatDuration, downsampleTrace } from '../lib/format.js';
 
 const router = Router();
@@ -33,12 +33,19 @@ router.post('/upload', requireAuth, upload.single('gpx'), async (req, res, next)
       return res.status(400).json({ error: 'Fichier GPX manquant (champ "gpx")' });
     }
 
+    // ─── Parcours ──────────────────────────────────────────────────────────
+    const courseId = req.body.course_id || DEFAULT_COURSE_ID;
+    if (!isValidCourseId(courseId)) {
+      return res.status(400).json({ error: `Parcours inconnu : ${courseId}` });
+    }
+    const course = getCourse(courseId);
+
     // ─── Validation des champs du formulaire ───────────────────────────────
     const category = req.body.category;
-    if (!CATEGORIES.includes(category)) {
+    if (!course.categories.includes(category)) {
       return res
         .status(400)
-        .json({ error: `Catégorie invalide. Attendu : ${CATEGORIES.join(', ')}` });
+        .json({ error: `Catégorie invalide. Attendu : ${course.categories.join(', ')}` });
     }
 
     let windForce = null;
@@ -63,7 +70,11 @@ router.post('/upload', requireAuth, upload.single('gpx'), async (req, res, next)
       return res.status(400).json({ error: 'Aucun point GPS exploitable dans ce fichier' });
     }
 
-    const analysis = analyzeTrack(points);
+    const detection = detectTour(points, course);
+    const best = detection.bestTour;
+
+    const sampleIntervalSeconds = estimateSampleIntervalSeconds(points);
+    const lowFrequencyWarning = sampleIntervalSeconds != null && sampleIntervalSeconds > 2;
 
     // ─── 2) Stockage du GPX (Supabase Storage, bucket privé) ───────────────
     const sessionId = randomUUID();
@@ -77,40 +88,46 @@ router.post('/upload', requireAuth, upload.single('gpx'), async (req, res, next)
     if (uploadError) throw new Error(`Upload Storage échoué : ${uploadError.message}`);
 
     // ─── 3) Création de la session ─────────────────────────────────────────
-    const status = analysis.best ? 'valid' : 'invalid';
+    const status = detection.valid ? 'valid' : 'invalid';
     const { data: session, error: sessionError } = await supabaseAdmin
       .from('sessions')
       .insert({
         id: sessionId,
         user_id: userId,
+        course_id: courseId,
         gpx_file_url: storagePath,
         status,
         raw_points_count: points.length,
       })
-      .select('id, status, uploaded_at, raw_points_count')
+      .select('id, status, uploaded_at, raw_points_count, course_id')
       .single();
     if (sessionError) throw new Error(sessionError.message);
 
-    // ─── 4) Création de la performance si tour valide ──────────────────────
+    // ─── 4) Performance + secteurs si tour valide ──────────────────────────
     let performance = null;
-    if (analysis.best) {
-      const b = analysis.best;
-      const tracePoints = downsampleTrace(b.points, 500).map((p) => ({
+    if (best) {
+      const tracePoints = downsampleTrace(best.points, 500).map((p) => ({
         lat: p.lat,
         lon: p.lon,
         t: new Date(p.time).toISOString(),
       }));
+
+      // Secteurs réellement mesurés (durée non nulle), sérialisés en jsonb.
+      const measuredSectors = (best.sectors || []).filter((s) => s.durationSeconds != null);
 
       const { data: perf, error: perfError } = await supabaseAdmin
         .from('performances')
         .insert({
           session_id: sessionId,
           user_id: userId,
-          duration_seconds: Math.round(b.durationSeconds),
-          distance_km: Number(b.distanceKm.toFixed(3)),
-          avg_speed_knots: Number(b.avgSpeedKnots.toFixed(2)),
-          start_time: new Date(b.startTime).toISOString(),
-          end_time: new Date(b.endTime).toISOString(),
+          course_id: courseId,
+          duration_seconds: Math.round(best.durationSeconds),
+          distance_km: Number(best.distanceKm.toFixed(3)),
+          avg_speed_knots: Number(best.avgSpeedKnots.toFixed(2)),
+          vmax_knots: best.vmaxKnots != null ? Number(best.vmaxKnots.toFixed(2)) : null,
+          sector_times: measuredSectors,
+          start_time: new Date(best.startTime).toISOString(),
+          end_time: new Date(best.endTime).toISOString(),
           category,
           wind_force_beaufort: windForce,
           comment,
@@ -120,13 +137,31 @@ router.post('/upload', requireAuth, upload.single('gpx'), async (req, res, next)
         .single();
       if (perfError) throw new Error(perfError.message);
       performance = perf;
+
+      // Lignes de classement par secteur.
+      if (measuredSectors.length > 0) {
+        const sectorRows = measuredSectors.map((s) => ({
+          performance_id: perf.id,
+          user_id: userId,
+          course_id: courseId,
+          sector_id: s.sectorId,
+          sector_name: s.name,
+          duration_seconds: s.durationSeconds,
+          category,
+          achieved_at: perf.validated_at,
+        }));
+        const { error: sectorError } = await supabaseAdmin
+          .from('sector_performances')
+          .insert(sectorRows);
+        if (sectorError) throw new Error(sectorError.message);
+      }
     }
 
     // ─── 5) Réponse ────────────────────────────────────────────────────────
     const warnings = [];
-    if (analysis.lowFrequencyWarning) {
+    if (lowFrequencyWarning) {
       warnings.push(
-        `Fréquence GPS faible (~${analysis.sampleIntervalSeconds}s entre deux points). ` +
+        `Fréquence GPS faible (~${sampleIntervalSeconds}s entre deux points). ` +
           '1 point/seconde est recommandé pour une mesure précise.',
       );
     }
@@ -135,31 +170,32 @@ router.post('/upload', requireAuth, upload.single('gpx'), async (req, res, next)
       session,
       performance,
       warnings,
+      courseId,
+      courseName: course.name,
       analysis: {
-        tourDetected: Boolean(analysis.best),
-        toursDetected: analysis.toursDetected,
-        totalPoints: analysis.totalPoints,
-        pointsInZone: analysis.pointsInZone,
-        sampleIntervalSeconds: analysis.sampleIntervalSeconds,
-        lowFrequencyWarning: analysis.lowFrequencyWarning,
+        tourDetected: detection.valid,
+        toursDetected: detection.allTours.length,
+        totalPoints: points.length,
+        sampleIntervalSeconds,
+        lowFrequencyWarning,
       },
     };
 
-    if (analysis.best) {
-      const b = analysis.best;
+    if (best) {
       response.best = {
-        durationSeconds: Math.round(b.durationSeconds),
-        durationLabel: formatDuration(b.durationSeconds),
-        distanceKm: Number(b.distanceKm.toFixed(2)),
-        avgSpeedKnots: Number(b.avgSpeedKnots.toFixed(2)),
-        startTime: new Date(b.startTime).toISOString(),
-        endTime: new Date(b.endTime).toISOString(),
-        points: downsampleTrace(b.points, 500).map((p) => ({ lat: p.lat, lon: p.lon })),
+        durationSeconds: Math.round(best.durationSeconds),
+        durationLabel: formatDuration(best.durationSeconds),
+        distanceKm: Number(best.distanceKm.toFixed(2)),
+        avgSpeedKnots: Number(best.avgSpeedKnots.toFixed(2)),
+        vmaxKnots: best.vmaxKnots != null ? Number(best.vmaxKnots.toFixed(2)) : null,
+        startTime: new Date(best.startTime).toISOString(),
+        endTime: new Date(best.endTime).toISOString(),
+        sectors: (best.sectors || []).filter((s) => s.durationSeconds != null),
+        points: downsampleTrace(best.points, 500).map((p) => ({ lat: p.lat, lon: p.lon })),
       };
-      response.message = `Tour détecté ✓ — Meilleur temps : ${response.best.durationLabel} — Distance : ${response.best.distanceKm.toFixed(1)} km`;
+      response.message = `Tour détecté ✓ — ${course.name} — Meilleur temps : ${response.best.durationLabel} — Distance : ${response.best.distanceKm.toFixed(1)} km — Vmax : ${response.best.vmaxKnots ?? '—'} nds`;
     } else {
-      response.message =
-        "Aucun tour complet de l'Île-aux-Moines détecté dans cette trace.";
+      response.message = `Aucun tour valide détecté pour « ${course.name} » dans cette trace.`;
     }
 
     res.status(201).json(response);
@@ -169,8 +205,8 @@ router.post('/upload', requireAuth, upload.single('gpx'), async (req, res, next)
 });
 
 // DELETE /api/sessions/:id — supprime une trace de l'utilisateur courant.
-// La suppression de la session retire en cascade sa performance (contrainte FK
-// ON DELETE CASCADE), donc le record disparaît aussi du classement.
+// La suppression de la session retire en cascade sa performance (FK ON DELETE
+// CASCADE), qui retire elle-même ses sector_performances (FK CASCADE).
 router.delete('/:id', requireAuth, async (req, res, next) => {
   try {
     if (!isSupabaseConfigured) {
@@ -201,7 +237,7 @@ router.delete('/:id', requireAuth, async (req, res, next) => {
       if (storageError) console.warn('[delete] Storage:', storageError.message);
     }
 
-    // Supprime la session (cascade -> performances).
+    // Supprime la session (cascade -> performances -> sector_performances).
     const { error: deleteError } = await supabaseAdmin
       .from('sessions')
       .delete()

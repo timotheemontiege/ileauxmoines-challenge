@@ -1,9 +1,9 @@
 {
-  "name": "ileauxmoines-backend",
-  "version": "1.0.0",
+  "name": "tour-ile-challenge-backend",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "API REST + détection de tour (winding number) pour les records de l'Île-aux-Moines.",
+  "description": "API REST + détection multi-parcours (winding number / waypoints) pour Tour Île Challenge — records de tours du Golfe du Morbihan.",
   "main": "src/index.js",
   "scripts": {
     "dev": "node --watch src/index.js",

@@ -1,13 +1,15 @@
-// Routes de lecture : classement et profil.
+// Routes de lecture : classement (global + secteurs) et profil.
 import { Router } from 'express';
 import { supabaseAdmin, isSupabaseConfigured } from '../lib/supabase.js';
 import { CATEGORIES } from '../core/constants.js';
+import { isValidCourseId, DEFAULT_COURSE_ID, getCourse } from '../config/courses.js';
 
 const router = Router();
 const PERIODS = ['all', 'year', '30d'];
 
 const parseCategory = (v) => (typeof v === 'string' && CATEGORIES.includes(v) ? v : 'all');
 const parsePeriod = (v) => (typeof v === 'string' && PERIODS.includes(v) ? v : 'all');
+const parseCourse = (v) => (isValidCourseId(v) ? v : DEFAULT_COURSE_ID);
 
 function ensureConfigured(res) {
   if (!isSupabaseConfigured) {
@@ -17,17 +19,19 @@ function ensureConfigured(res) {
   return true;
 }
 
-// GET /api/leaderboard?category=&period=&page=&pageSize=
+// GET /api/leaderboard?course_id=&category=&period=&page=&pageSize=
 router.get('/leaderboard', async (req, res, next) => {
   try {
     if (!ensureConfigured(res)) return;
 
+    const courseId = parseCourse(req.query.course_id);
     const category = parseCategory(req.query.category);
     const period = parsePeriod(req.query.period);
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
 
     const { data, error } = await supabaseAdmin.rpc('get_leaderboard', {
+      p_course_id: courseId,
       p_category: category,
       p_period: period,
     });
@@ -44,6 +48,7 @@ router.get('/leaderboard', async (req, res, next) => {
       page,
       pageSize,
       totalPages: Math.max(1, Math.ceil(total / pageSize)),
+      courseId,
       category,
       period,
     });
@@ -52,29 +57,68 @@ router.get('/leaderboard', async (req, res, next) => {
   }
 });
 
-// GET /api/leaderboard/traces?category=&period=&limit=  (pour la carte)
+// GET /api/leaderboard/sectors?course_id=&sector_id=&category=&period=
+router.get('/leaderboard/sectors', async (req, res, next) => {
+  try {
+    if (!ensureConfigured(res)) return;
+
+    const courseId = parseCourse(req.query.course_id);
+    const sectorId = typeof req.query.sector_id === 'string' ? req.query.sector_id : '';
+    const category = parseCategory(req.query.category);
+    const period = parsePeriod(req.query.period);
+
+    const course = getCourse(courseId);
+    const sector = course?.sectors.find((s) => s.id === sectorId) || null;
+    if (!sector) {
+      return res.status(400).json({ error: `Secteur inconnu pour ce parcours : ${sectorId}` });
+    }
+
+    const { data, error } = await supabaseAdmin.rpc('get_sector_leaderboard', {
+      p_course_id: courseId,
+      p_sector_id: sectorId,
+      p_category: category,
+      p_period: period,
+    });
+    if (error) throw new Error(error.message);
+
+    res.json({
+      entries: data || [],
+      courseId,
+      sectorId,
+      sectorName: sector.name,
+      category,
+      period,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/leaderboard/traces?course_id=&category=&period=&limit=  (pour la carte)
 router.get('/leaderboard/traces', async (req, res, next) => {
   try {
     if (!ensureConfigured(res)) return;
 
+    const courseId = parseCourse(req.query.course_id);
     const category = parseCategory(req.query.category);
     const period = parsePeriod(req.query.period);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 30));
 
     const { data, error } = await supabaseAdmin.rpc('get_leaderboard_traces', {
+      p_course_id: courseId,
       p_category: category,
       p_period: period,
       p_limit: limit,
     });
     if (error) throw new Error(error.message);
 
-    res.json({ traces: data || [] });
+    res.json({ traces: data || [], courseId });
   } catch (err) {
     next(err);
   }
 });
 
-// GET /api/profile/:username
+// GET /api/profile/:username — records par parcours ET par secteur.
 router.get('/profile/:username', async (req, res, next) => {
   try {
     if (!ensureConfigured(res)) return;
@@ -91,7 +135,7 @@ router.get('/profile/:username', async (req, res, next) => {
 
     const { data: sessions, error: sessionsError } = await supabaseAdmin
       .from('sessions')
-      .select('id, status, uploaded_at, raw_points_count')
+      .select('id, status, uploaded_at, raw_points_count, course_id')
       .eq('user_id', profile.id)
       .order('uploaded_at', { ascending: false });
     if (sessionsError) throw new Error(sessionsError.message);
@@ -99,34 +143,53 @@ router.get('/profile/:username', async (req, res, next) => {
     const { data: performances, error: perfError } = await supabaseAdmin
       .from('performances')
       .select(
-        'id, session_id, duration_seconds, distance_km, avg_speed_knots, category, wind_force_beaufort, comment, start_time, end_time, validated_at',
+        'id, session_id, course_id, duration_seconds, distance_km, avg_speed_knots, vmax_knots, sector_times, category, wind_force_beaufort, comment, start_time, end_time, validated_at',
       )
       .eq('user_id', profile.id)
       .order('validated_at', { ascending: true });
     if (perfError) throw new Error(perfError.message);
 
-    // Meilleur temps par catégorie.
-    const bestByCategory = {};
+    const { data: sectorPerfs, error: sectorError } = await supabaseAdmin
+      .from('sector_performances')
+      .select('id, performance_id, course_id, sector_id, sector_name, duration_seconds, category, achieved_at')
+      .eq('user_id', profile.id)
+      .order('duration_seconds', { ascending: true });
+    if (sectorError) throw new Error(sectorError.message);
+
+    // Meilleur temps par parcours puis par catégorie.
+    const bestByCourse = {};
     for (const p of performances || []) {
-      const current = bestByCategory[p.category];
-      if (!current || p.duration_seconds < current.duration_seconds) {
-        bestByCategory[p.category] = p;
+      const c = (bestByCourse[p.course_id] ||= {});
+      if (!c[p.category] || p.duration_seconds < c[p.category].duration_seconds) {
+        c[p.category] = p;
+      }
+    }
+
+    // Meilleur temps par parcours puis par secteur (un record par secteur).
+    const sectorRecords = {};
+    for (const s of sectorPerfs || []) {
+      const bucket = (sectorRecords[s.course_id] ||= {});
+      if (!bucket[s.sector_id] || s.duration_seconds < bucket[s.sector_id].duration_seconds) {
+        bucket[s.sector_id] = s;
       }
     }
 
     // Points de progression (chronologiques) pour les courbes recharts.
     const progression = (performances || []).map((p) => ({
       date: p.validated_at,
+      course_id: p.course_id,
       category: p.category,
       duration_seconds: p.duration_seconds,
       avg_speed_knots: p.avg_speed_knots,
+      vmax_knots: p.vmax_knots,
     }));
 
     res.json({
       profile,
       sessions: sessions || [],
       performances: performances || [],
-      bestByCategory,
+      bestByCourse,
+      sectorRecords,
       progression,
     });
   } catch (err) {

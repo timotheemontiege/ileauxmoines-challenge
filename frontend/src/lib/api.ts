@@ -1,6 +1,7 @@
 import type {
   LeaderboardResponse,
   ProfileResponse,
+  SectorLeaderboardResponse,
   TraceRecord,
   UploadResponse,
 } from '../types';
@@ -23,6 +24,7 @@ async function handle<T>(res: Response): Promise<T> {
 }
 
 export interface LeaderboardQuery {
+  course?: string;
   category?: string;
   period?: string;
   page?: number;
@@ -33,6 +35,7 @@ export async function getLeaderboard(
   query: LeaderboardQuery = {},
 ): Promise<LeaderboardResponse> {
   const params = new URLSearchParams();
+  if (query.course) params.set('course_id', query.course);
   if (query.category) params.set('category', query.category);
   if (query.period) params.set('period', query.period);
   if (query.page) params.set('page', String(query.page));
@@ -41,12 +44,31 @@ export async function getLeaderboard(
   return handle<LeaderboardResponse>(res);
 }
 
+export async function getSectorLeaderboard(query: {
+  course: string;
+  sector: string;
+  category?: string;
+  period?: string;
+}): Promise<SectorLeaderboardResponse> {
+  const params = new URLSearchParams();
+  params.set('course_id', query.course);
+  params.set('sector_id', query.sector);
+  if (query.category) params.set('category', query.category);
+  if (query.period) params.set('period', query.period);
+  const res = await fetch(
+    `${API_URL}/api/leaderboard/sectors?${params.toString()}`,
+  );
+  return handle<SectorLeaderboardResponse>(res);
+}
+
 export async function getLeaderboardTraces(query: {
+  course?: string;
   category?: string;
   period?: string;
   limit?: number;
 }): Promise<TraceRecord[]> {
   const params = new URLSearchParams();
+  if (query.course) params.set('course_id', query.course);
   if (query.category) params.set('category', query.category);
   if (query.period) params.set('period', query.period);
   if (query.limit) params.set('limit', String(query.limit));
@@ -66,6 +88,7 @@ export async function getProfile(username: string): Promise<ProfileResponse> {
 
 export interface UploadParams {
   file: File;
+  courseId: string;
   category: string;
   windForce?: number | null;
   comment?: string;
@@ -74,6 +97,7 @@ export interface UploadParams {
 
 export async function uploadSession({
   file,
+  courseId,
   category,
   windForce,
   comment,
@@ -81,6 +105,7 @@ export async function uploadSession({
 }: UploadParams): Promise<UploadResponse> {
   const form = new FormData();
   form.append('gpx', file);
+  form.append('course_id', courseId);
   form.append('category', category);
   if (windForce != null && !Number.isNaN(windForce)) {
     form.append('wind_force_beaufort', String(windForce));

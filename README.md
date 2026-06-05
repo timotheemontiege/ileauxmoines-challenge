@@ -1,15 +1,24 @@
-# 🏝️ Île-aux-Moines Challenge
+# ⛵ Tour Île Challenge
 
-Site de records du **tour de l'Île-aux-Moines à la voile** (Golfe du Morbihan),
-dans l'esprit de _basedevitesse.com_.
+Plateforme **multi-parcours** de records de tours à la voile dans le **Golfe du
+Morbihan**, dans l'esprit de _basedevitesse.com_.
 
-Les utilisateurs envoient une trace **GPX**. Le backend détecte automatiquement
-si un **tour complet** de l'île a été réalisé (algorithme _winding number_),
-extrait le **meilleur temps**, et met à jour un **classement public** par
-catégorie de matériel (wingfoil, windsurf, kitesurf, voile légère, autre).
+Trois parcours sont proposés :
+
+- **Tour de l'Île-aux-Moines** — détection par _winding number_ ;
+- **Tour de l'Île d'Arz** — détection par _winding number_ ;
+- **Tour du Golfe du Morbihan** — validation par **waypoints ordonnés** (8 points).
+
+Les utilisateurs envoient une trace **GPX** pour le parcours choisi. Le backend
+détecte automatiquement le **meilleur tour**, calcule le **temps**, la
+**distance**, la **vitesse moyenne**, la **Vmax** (vitesse max instantanée) et
+les **temps par secteur géographique**, puis met à jour un **classement public**
+(global et par secteur) par catégorie de matériel (wingfoil, windsurf, kitesurf,
+voile légère, autre).
 
 ```
-Trace GPX ──▶ Parsing (backend) ──▶ Winding number ──▶ Meilleur tour ──▶ Classement
+Trace GPX ─▶ Parsing ─▶ detectTour(courseConfig) ─▶ Meilleur tour + Vmax + secteurs ─▶ Classement
+                         winding number | waypoints
 ```
 
 ---
@@ -34,25 +43,30 @@ Trace GPX ──▶ Parsing (backend) ──▶ Winding number ──▶ Meilleu
 ├── frontend/                 # React + Vite
 │   ├── src/
 │   │   ├── pages/            # Home, Leaderboard, Submit, Profile, Login, Register
-│   │   ├── components/       # Navbar, TourMap (Leaflet), Podium, LeaderboardTable…
-│   │   ├── hooks/useAuth.tsx # Contexte d'authentification Supabase
-│   │   └── lib/              # supabaseClient, api, categories, format
+│   │   ├── components/       # Navbar, CourseSelector, TourMap, Podium, *Table…
+│   │   ├── hooks/            # useAuth (Supabase), useCourse (parcours global + URL)
+│   │   ├── config/courses.ts # ⭐ miroir typé de la config des parcours
+│   │   └── lib/              # supabaseClient, api, categories, format, sectors
 │   ├── vercel.json
 │   └── .env.example
 ├── backend/                  # Node.js + Express
 │   ├── src/
+│   │   ├── config/courses.js     # ⭐ config centrale des 3 parcours (OSM)
 │   │   ├── core/
 │   │   │   ├── gpxParser.js       # XML → points { lat, lon, ele, time }
-│   │   │   ├── tourDetector.js    # ⭐ algorithme winding number
+│   │   │   ├── tourDetector.js    # ⭐ detectTour : winding number | waypoints, Vmax, secteurs
 │   │   │   ├── tourDetector.test.js
 │   │   │   ├── geo.js             # Haversine, conversions
 │   │   │   └── constants.js       # centroïde île, bounding box Golfe
 │   │   ├── routes/
-│   │   │   ├── sessions.js        # POST /api/sessions/upload
-│   │   │   └── performances.js    # GET /api/leaderboard, /api/profile/:username
+│   │   │   ├── sessions.js        # POST /api/sessions/upload (course_id, secteurs)
+│   │   │   └── performances.js    # GET /api/leaderboard(/sectors), /api/profile/:username
 │   │   ├── lib/                   # supabase, auth (JWT), format
 │   │   └── index.js
-│   ├── supabase/migrations/0001_init.sql
+│   ├── supabase/migrations/
+│   │   ├── 0001_init.sql
+│   │   └── 0002_multi_course.sql # ⭐ course_id, vmax, secteurs, sector_performances
+│   ├── tests/test_tour_detector.py # ⭐ tests Python (portage, Node absent)
 │   ├── Procfile
 │   └── .env.example
 └── samples/tour-exemple.gpx  # GPX de test (tour complet)
@@ -75,10 +89,12 @@ Tu auras aussi besoin d'un compte **Supabase** (gratuit) : <https://supabase.com
 ### 1. Supabase
 
 1. Crée un projet sur Supabase.
-2. **SQL Editor** → colle le contenu de
-   [`backend/supabase/migrations/0001_init.sql`](backend/supabase/migrations/0001_init.sql)
-   → **Run**. (Crée les tables, la RLS, le bucket `gpx`, le trigger de profil
-   et les fonctions de classement.)
+2. **SQL Editor** → exécute **dans l'ordre** :
+   1. [`backend/supabase/migrations/0001_init.sql`](backend/supabase/migrations/0001_init.sql)
+      (tables, RLS, bucket `gpx`, trigger de profil, fonctions de classement) ;
+   2. [`backend/supabase/migrations/0002_multi_course.sql`](backend/supabase/migrations/0002_multi_course.sql)
+      (colonnes `course_id` / `vmax_knots` / `sector_times`, table
+      `sector_performances`, RPC mises à jour + `get_sector_leaderboard`).
 3. **Authentication → Providers** : active **Email**. Pour tester sans email,
    tu peux désactiver « Confirm email » (Authentication → Settings).
 4. **Settings → API** : récupère
@@ -119,18 +135,36 @@ npm run dev                 # http://localhost:5173
 ### 4. Tester
 
 1. Va sur `/register`, crée un compte (choisis un pseudo).
-2. Va sur `/submit`, envoie [`samples/tour-exemple.gpx`](samples/tour-exemple.gpx).
-3. Résultat attendu : **Tour détecté ✓ — ≈ 00:22:46 — ≈ 9.3 km**.
-4. Le record apparaît sur `/` et `/leaderboard`.
+2. Sélectionne le parcours **Île-aux-Moines** (sélecteur de la barre).
+3. Va sur `/submit`, envoie [`samples/tour-exemple.gpx`](samples/tour-exemple.gpx).
+4. Résultat attendu : **Tour détecté ✓** (≈ 00:22:46 — ≈ 9.3 km) avec Vmax et
+   temps par secteur.
+5. Le record apparaît sur `/` et `/leaderboard` (filtrés par parcours), avec
+   un onglet **Classement par secteur**.
 
 ---
 
-## 🧭 L'algorithme de détection (cœur du projet)
+## 🧭 Les algorithmes de détection (cœur du projet)
 
-Fichier : [`backend/src/core/tourDetector.js`](backend/src/core/tourDetector.js)
+Fichier : [`backend/src/core/tourDetector.js`](backend/src/core/tourDetector.js).
+Point d'entrée : `detectTour(points, courseConfig)` → `{ valid, bestTour, allTours }`,
+qui route selon `courseConfig.validationType` (`winding` ou `waypoints`). La
+config des parcours (coordonnées OSM des pointes / waypoints, secteurs) vit dans
+[`backend/src/config/courses.js`](backend/src/config/courses.js) (miroir frontend
+typé dans `frontend/src/config/courses.ts`).
+
+Sur le meilleur tour, on calcule aussi :
+
+- **Vmax** : vitesse max instantanée sur une **fenêtre glissante ≥ 2 s**
+  (`distance(Pᵢ, Pⱼ) / Δt`), ce qui élimine les artefacts GPS (Δt minuscule) tout
+  en conservant une accélération réellement tenue ;
+- **Temps par secteur** : découpe du tour entre les **bornes de secteur** (pointes
+  pour le winding, waypoints consécutifs pour le Tour du Golfe).
+
+### A. Winding number (Île-aux-Moines, Île d'Arz)
 
 Méthode **winding number** (indice d'enroulement) autour du **centroïde de
-l'île** (`47.5975, -2.8433`) :
+l'île** (Île-aux-Moines : `47.5975, -2.8433`) :
 
 1. **Parsing** GPX → points `{ lat, lon, time }`.
 2. **Filtrage** des points hors Golfe (bbox `lat [47.4, 47.8]`, `lon [-3.1, -2.6]`)
@@ -151,15 +185,31 @@ rotation **nette** (les allers-retours s'annulent).
 > Un avertissement est affiché si la **fréquence GPS** est trop basse
 > (> 2 s entre deux points ; 1 pt/s recommandé).
 
+### B. Waypoints ordonnés (Tour du Golfe)
+
+Le tour est valide si **tous les waypoints** (8 points GPS du Golfe) sont
+**passés dans l'ordre** : un waypoint est « passé » si un point de la trace entre
+dans son rayon (`radiusMeters = 300`). Le chrono court du **premier passage du
+waypoint 0** au **dernier passage du waypoint final**. Repasser une borne déjà
+validée (demi-tour accidentel) **n'invalide pas** le tour. Les secteurs sont les
+**intervalles entre waypoints consécutifs**.
+
 ### Tests
 
-[`tourDetector.test.js`](backend/src/core/tourDetector.test.js) couvre :
-tour complet, sens horaire, **demi-tour** (rejeté), **2 tours consécutifs**,
-**trace bruitée** (voiture + jitter), trace vide, fréquence GPS.
+**Node.js n'étant pas installé**, la logique JS est portée en **Python 3** et
+testée dans
+[`backend/tests/test_tour_detector.py`](backend/tests/test_tour_detector.py) :
+tour complet / sens horaire / **demi-tour rejeté** / **2 tours** / **trace bruitée**,
+waypoints **dans l'ordre / manquant / en désordre / demi-tour toléré**,
+**Vmax** (artefact éliminé, pic 2 s conservé, atténuation), **secteurs**
+(découpe correcte winding & waypoints, secteur absent si tour incomplet).
 
 ```bash
-cd backend && npm test
+python backend/tests/test_tour_detector.py     # 16 tests, stdlib uniquement
 ```
+
+> Le fichier vitest historique [`tourDetector.test.js`](backend/src/core/tourDetector.test.js)
+> reste présent pour `npm test` une fois Node installé.
 
 ---
 
@@ -169,13 +219,17 @@ cd backend && npm test
 | ------- | ----------------------------- | ---- | -------------------------------------------- |
 | GET     | `/api/health`                 | —    | État du serveur                              |
 | GET     | `/api/categories`             | —    | Liste des catégories                         |
+| GET     | `/api/courses`                | —    | Liste des parcours (config, waypoints, secteurs) |
 | POST    | `/api/sessions/upload`        | ✅   | Upload GPX (`multipart`) + analyse + record  |
-| GET     | `/api/leaderboard`            | —    | Classement paginé (`category`, `period`, `page`) |
-| GET     | `/api/leaderboard/traces`     | —    | Tracés des records (pour la carte)           |
-| GET     | `/api/profile/:username`      | —    | Profil : sessions, records, progression      |
+| GET     | `/api/leaderboard`            | —    | Classement paginé (`course_id`, `category`, `period`, `page`) |
+| GET     | `/api/leaderboard/sectors`    | —    | Classement par secteur (`course_id`, `sector_id`, …) |
+| GET     | `/api/leaderboard/traces`     | —    | Tracés des records (pour la carte, `course_id`) |
+| GET     | `/api/profile/:username`      | —    | Profil : records par parcours **et** par secteur |
 
 `POST /api/sessions/upload` attend le header `Authorization: Bearer <jwt>` et un
-form-data : `gpx` (fichier), `category`, `wind_force_beaufort?`, `comment?`.
+form-data : `gpx` (fichier), `course_id`, `category`, `wind_force_beaufort?`,
+`comment?`. Réponse : `tourDetected`, `duration`, `distance`, `avgSpeed`,
+`vmaxKnots`, `sectors`, `courseId`, `courseName`.
 
 ---
 
@@ -201,11 +255,15 @@ form-data : `gpx` (fichier), `category`, `wind_force_beaufort?`, `comment?`.
 ## 🗃️ Schéma de données
 
 - **profiles** — `id` (= `auth.users.id`), `username` (unique), `avatar_url`, `created_at`
-- **sessions** — un upload GPX : `gpx_file_url`, `status` (`pending|valid|invalid`),
-  `raw_points_count`
-- **performances** — le meilleur tour : `duration_seconds`, `distance_km`,
-  `avg_speed_knots`, `start_time`/`end_time`, `category`, `wind_force_beaufort`,
-  `comment`, `gpx_tour_points` (jsonb pour la carte)
+- **sessions** — un upload GPX : `course_id`, `gpx_file_url`,
+  `status` (`pending|valid|invalid`), `raw_points_count`
+- **performances** — le meilleur tour : `course_id`, `duration_seconds`,
+  `distance_km`, `avg_speed_knots`, **`vmax_knots`**, **`sector_times`** (jsonb),
+  `start_time`/`end_time`, `category`, `wind_force_beaufort`, `comment`,
+  `gpx_tour_points` (jsonb pour la carte)
+- **sector_performances** — un temps de secteur (classement par secteur) :
+  `performance_id`, `user_id`, `course_id`, `sector_id`, `sector_name`,
+  `duration_seconds`, `category`, `achieved_at`
 
 RLS : **lecture publique** (classement public), **écritures via le backend**
 (clé `service_role`). Les fichiers GPX restent dans un bucket **privé**.

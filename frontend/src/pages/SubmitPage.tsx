@@ -1,16 +1,21 @@
-import { useState, type FormEvent } from 'react';
+import { useMemo, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
-import { uploadSession } from '../lib/api';
+import { useCourse } from '../hooks/useCourse';
+import { getSectorLeaderboard, uploadSession } from '../lib/api';
 import type { UploadResponse } from '../types';
 import { CATEGORIES, categoryColor } from '../lib/categories';
-import TourMap, { type MapTrace } from '../components/TourMap';
+import { segmentTourBySectors, sectorColor } from '../lib/sectors';
+import TourMap, { type MapTrace, type MapWaypoint } from '../components/TourMap';
+import CourseSelector from '../components/CourseSelector';
 import Spinner from '../components/Spinner';
+import { formatDuration } from '../lib/format';
 
 const BEAUFORT = Array.from({ length: 13 }, (_, i) => i); // 0..12
 
 export default function SubmitPage() {
   const { session } = useAuth();
+  const { course, courseId } = useCourse();
 
   const [file, setFile] = useState<File | null>(null);
   const [category, setCategory] = useState('wingfoil');
@@ -19,11 +24,26 @@ export default function SubmitPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<UploadResponse | null>(null);
+  // record par secteur (pour la coloration relative) : sectorId -> secondes | null
+  const [sectorRecords, setSectorRecords] = useState<Record<string, number | null>>({});
+
+  const courseWaypoints = useMemo<MapWaypoint[]>(
+    () =>
+      course.waypoints.map((w) => ({
+        id: w.id,
+        name: w.name,
+        lat: w.lat,
+        lon: w.lon,
+        radiusMeters: w.radiusMeters,
+      })),
+    [course],
+  );
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setError(null);
     setResult(null);
+    setSectorRecords({});
 
     if (!file) {
       setError('Sélectionne un fichier GPX.');
@@ -38,12 +58,25 @@ export default function SubmitPage() {
     try {
       const res = await uploadSession({
         file,
+        courseId,
         category,
         windForce: wind === '' ? null : parseInt(wind, 10),
         comment: comment.trim() || undefined,
         token: session.access_token,
       });
       setResult(res);
+
+      // Récupère les records de secteur pour colorer le rendu (best-effort).
+      if (res.best) {
+        const records = await Promise.all(
+          course.sectors.map((s) =>
+            getSectorLeaderboard({ course: courseId, sector: s.id, category: 'all', period: 'all' })
+              .then((r) => [s.id, r.entries[0]?.duration_seconds ?? null] as const)
+              .catch(() => [s.id, null] as const),
+          ),
+        );
+        setSectorRecords(Object.fromEntries(records));
+      }
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -56,30 +89,58 @@ export default function SubmitPage() {
     setFile(null);
     setComment('');
     setWind('');
+    setSectorRecords({});
   }
 
-  const previewTraces: MapTrace[] = result?.best
-    ? [
-        {
-          id: 'preview',
-          positions: result.best.points.map(
-            (p) => [p.lat, p.lon] as [number, number],
-          ),
-          color: categoryColor(category),
-          label: `Tour détecté · ${result.best.durationLabel}`,
-        },
-      ]
-    : [];
+  // Carte de résultat : un segment coloré par secteur (vert rapide → rouge lent).
+  const sectorSegments = useMemo<MapTrace[]>(() => {
+    if (!result?.best) return [];
+    const durations = new Map(
+      result.best.sectors.map((s) => [s.sectorId, s.durationSeconds] as [string, number]),
+    );
+    return segmentTourBySectors(result.best.points, course)
+      .filter((seg) => seg.positions.length > 1)
+      .map((seg) => {
+        const dur = durations.get(seg.sectorId);
+        const color =
+          dur != null ? sectorColor(dur, sectorRecords[seg.sectorId] ?? null) : '#64748b';
+        return {
+          id: seg.sectorId,
+          positions: seg.positions,
+          color,
+          label: dur != null ? `${seg.name} · ${formatDuration(dur)}` : seg.name,
+        };
+      });
+  }, [result, course, sectorRecords]);
 
   return (
     <div className="mx-auto max-w-3xl space-y-8">
       <header>
         <h1 className="text-3xl font-black">Soumettre une trace</h1>
         <p className="mt-1 text-slate-400">
-          Fichier .gpx d'une session autour de l'Île-aux-Moines. L'analyse du
-          tour se fait automatiquement côté serveur.
+          Fichier .gpx d'une session. L'analyse du tour se fait automatiquement
+          côté serveur, selon le parcours choisi.
         </p>
       </header>
+
+      {/* Sélection du parcours + aperçu */}
+      <div className="card space-y-4 p-6">
+        <div>
+          <span className="label">Parcours</span>
+          <div className="mt-1">
+            <CourseSelector />
+          </div>
+          <p className="mt-2 text-sm text-slate-400">{course.description}</p>
+        </div>
+        <TourMap
+          traces={[]}
+          height={240}
+          center={[course.centroid.lat, course.centroid.lon]}
+          centerLabel={course.name}
+          waypoints={courseWaypoints}
+          showWaypointRadius={course.validationType === 'waypoints'}
+        />
+      </div>
 
       {!result && (
         <form onSubmit={handleSubmit} className="card space-y-5 p-6">
@@ -158,18 +219,14 @@ export default function SubmitPage() {
           {error && <p className="text-sm text-red-400">{error}</p>}
 
           <button type="submit" className="btn-primary w-full" disabled={loading}>
-            {loading ? (
-              <Spinner label="Analyse en cours…" />
-            ) : (
-              'Analyser et soumettre'
-            )}
+            {loading ? <Spinner label="Analyse en cours…" /> : 'Analyser et soumettre'}
           </button>
         </form>
       )}
 
       {result && (
         <div className="space-y-6">
-          {/* Bandeau résultat */}
+          {/* Bandeau résultat global */}
           <div
             className={`card p-6 ${
               result.best
@@ -187,27 +244,20 @@ export default function SubmitPage() {
 
             {result.best && (
               <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-4">
-                <Stat label="Meilleur temps" value={result.best.durationLabel} />
+                <Stat label="Temps total" value={result.best.durationLabel} />
+                <Stat label="Distance" value={`${result.best.distanceKm.toFixed(2)} km`} />
+                <Stat label="Vitesse moy." value={`${result.best.avgSpeedKnots.toFixed(1)} nds`} />
                 <Stat
-                  label="Distance"
-                  value={`${result.best.distanceKm.toFixed(2)} km`}
-                />
-                <Stat
-                  label="Vitesse moy."
-                  value={`${result.best.avgSpeedKnots.toFixed(1)} nds`}
-                />
-                <Stat
-                  label="Tours détectés"
-                  value={String(result.analysis.toursDetected)}
+                  label="Vmax"
+                  value={result.best.vmaxKnots != null ? `${result.best.vmaxKnots.toFixed(1)} nds` : '—'}
                 />
               </div>
             )}
 
             {!result.best && (
               <p className="mt-3 text-sm text-amber-200/80">
-                {result.analysis.pointsInZone} point(s) dans le Golfe sur{' '}
-                {result.analysis.totalPoints}. Vérifie que la trace fait bien le
-                tour complet de l'île.
+                {result.analysis.totalPoints} point(s) GPS analysés. Vérifie que la
+                trace couvre bien l'intégralité du parcours « {result.courseName} ».
               </p>
             )}
           </div>
@@ -221,11 +271,80 @@ export default function SubmitPage() {
             </div>
           )}
 
-          {/* Carte de prévisualisation */}
-          {previewTraces.length > 0 && (
+          {/* Temps par secteur */}
+          {result.best && result.best.sectors.some((s) => s.durationSeconds != null) && (
+            <div className="space-y-3">
+              <h2 className="text-lg font-bold">Temps par secteur</h2>
+              <div className="card divide-y divide-slate-800/70">
+                {result.best.sectors
+                  .filter((s) => s.durationSeconds != null)
+                  .map((s) => {
+                    const record = sectorRecords[s.sectorId] ?? null;
+                    const color = sectorColor(s.durationSeconds, record);
+                    const delta =
+                      record && record > 0
+                        ? Math.round(((s.durationSeconds - record) / record) * 100)
+                        : null;
+                    return (
+                      <div key={s.sectorId} className="flex items-center gap-3 px-4 py-3">
+                        <span
+                          className="h-3 w-3 shrink-0 rounded-full"
+                          style={{ backgroundColor: color }}
+                          aria-hidden
+                        />
+                        <span className="flex-1 text-sm text-slate-300">{s.name}</span>
+                        <span className="font-mono font-semibold text-white">
+                          {formatDuration(s.durationSeconds)}
+                        </span>
+                        <span className="w-24 text-right text-xs text-slate-400">
+                          {delta == null
+                            ? 'record !'
+                            : delta <= 0
+                              ? `${delta}% vs record`
+                              : `+${delta}% vs record`}
+                        </span>
+                      </div>
+                    );
+                  })}
+              </div>
+            </div>
+          )}
+
+          {/* Carte des secteurs colorés */}
+          {sectorSegments.length > 0 && (
+            <div className="space-y-2">
+              <h2 className="text-lg font-bold">Aperçu du tour par secteur</h2>
+              <TourMap
+                traces={sectorSegments}
+                height={420}
+                center={[course.centroid.lat, course.centroid.lon]}
+                centerLabel={course.name}
+                waypoints={courseWaypoints}
+                showWaypointRadius={course.validationType === 'waypoints'}
+              />
+              <p className="text-xs text-slate-500">
+                Couleur relative au record du secteur : vert = rapide, rouge = lent.
+              </p>
+            </div>
+          )}
+
+          {/* Aperçu simple si pas de secteurs mesurés */}
+          {result.best && sectorSegments.length === 0 && (
             <div className="space-y-2">
               <h2 className="text-lg font-bold">Aperçu du tour extrait</h2>
-              <TourMap traces={previewTraces} height={420} />
+              <TourMap
+                traces={[
+                  {
+                    id: 'preview',
+                    positions: result.best.points.map((p) => [p.lat, p.lon] as [number, number]),
+                    color: categoryColor(category),
+                    label: `Tour · ${result.best.durationLabel}`,
+                  },
+                ]}
+                height={420}
+                center={[course.centroid.lat, course.centroid.lon]}
+                centerLabel={course.name}
+              />
             </div>
           )}
 
@@ -247,9 +366,7 @@ function Stat({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-xl bg-slate-900/60 p-3 text-center">
       <div className="font-mono text-xl font-bold text-white">{value}</div>
-      <div className="mt-1 text-xs uppercase tracking-wide text-slate-400">
-        {label}
-      </div>
+      <div className="mt-1 text-xs uppercase tracking-wide text-slate-400">{label}</div>
     </div>
   );
 }

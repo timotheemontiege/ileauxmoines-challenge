@@ -30,6 +30,7 @@ export default function LeaderboardTable({
             <th className="px-4 py-3 font-semibold">Rider</th>
             <th className="px-4 py-3 font-semibold">Temps</th>
             <th className="px-4 py-3 font-semibold">Vit. moy.</th>
+            <th className="px-4 py-3 font-semibold">Vmax</th>
             <th className="px-4 py-3 font-semibold">Distance</th>
             <th className="px-4 py-3 font-semibold">Matériel</th>
             <th className="px-4 py-3 font-semibold">Date</th>
@@ -57,6 +58,9 @@ export default function LeaderboardTable({
                 </td>
                 <td className="px-4 py-3 text-slate-300">
                   {formatSpeed(e.avg_speed_knots)}
+                </td>
+                <td className="px-4 py-3 font-medium text-ocean-200">
+                  {e.vmax_knots != null ? formatSpeed(e.vmax_knots) : '—'}
                 </td>
                 <td className="px-4 py-3 text-slate-300">
                   {formatDistance(e.distance_km)}
