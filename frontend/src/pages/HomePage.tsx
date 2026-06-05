@@ -4,13 +4,15 @@ import { getLeaderboard, getLeaderboardTraces } from '../lib/api';
 import type { LeaderboardEntry, TraceRecord } from '../types';
 import { categoryColor } from '../lib/categories';
 import { formatDuration } from '../lib/format';
+import { useCourse } from '../hooks/useCourse';
 import Podium from '../components/Podium';
 import Filters from '../components/Filters';
 import LeaderboardTable from '../components/LeaderboardTable';
-import TourMap, { type MapTrace } from '../components/TourMap';
+import TourMap, { type MapTrace, type MapWaypoint } from '../components/TourMap';
 import Spinner from '../components/Spinner';
 
 export default function HomePage() {
+  const { course, courseId } = useCourse();
   const [category, setCategory] = useState('all');
   const [entries, setEntries] = useState<LeaderboardEntry[]>([]);
   const [traces, setTraces] = useState<TraceRecord[]>([]);
@@ -23,8 +25,8 @@ export default function HomePage() {
     setError(null);
 
     Promise.all([
-      getLeaderboard({ category, period: 'all', pageSize: 10 }),
-      getLeaderboardTraces({ category, period: 'all', limit: 20 }),
+      getLeaderboard({ course: courseId, category, period: 'all', pageSize: 10 }),
+      getLeaderboardTraces({ course: courseId, category, period: 'all', limit: 20 }),
     ])
       .then(([board, tr]) => {
         if (cancelled) return;
@@ -37,7 +39,7 @@ export default function HomePage() {
     return () => {
       cancelled = true;
     };
-  }, [category]);
+  }, [courseId, category]);
 
   const mapTraces = useMemo<MapTrace[]>(
     () =>
@@ -54,6 +56,20 @@ export default function HomePage() {
     [traces],
   );
 
+  const mapWaypoints = useMemo<MapWaypoint[]>(
+    () =>
+      course.waypoints.map((w) => ({
+        id: w.id,
+        name: w.name,
+        lat: w.lat,
+        lon: w.lon,
+        radiusMeters: w.radiusMeters,
+      })),
+    [course],
+  );
+
+  const isWaypointCourse = course.validationType === 'waypoints';
+
   return (
     <div className="space-y-12">
       {/* Hero */}
@@ -63,12 +79,9 @@ export default function HomePage() {
             Golfe du Morbihan
           </p>
           <h1 className="mt-2 text-4xl font-black leading-tight sm:text-5xl">
-            Le record du tour de l'Île-aux-Moines
+            {course.name}
           </h1>
-          <p className="mt-4 text-lg text-slate-300">
-            Envoie ta trace GPX. On détecte automatiquement le tour complet,
-            on extrait ton meilleur temps et on met à jour le classement.
-          </p>
+          <p className="mt-4 text-lg text-slate-300">{course.description}</p>
           <div className="mt-6 flex flex-wrap gap-3">
             <Link to="/submit" className="btn-primary">
               Soumettre une trace
@@ -110,10 +123,23 @@ export default function HomePage() {
                 showPeriod={false}
               />
             </div>
-            <TourMap traces={mapTraces} height={460} />
+            <TourMap
+              traces={mapTraces}
+              height={460}
+              center={[course.centroid.lat, course.centroid.lon]}
+              centerLabel={course.name}
+              waypoints={mapWaypoints}
+              showWaypointRadius={isWaypointCourse}
+            />
+            {isWaypointCourse && (
+              <p className="text-sm text-slate-500">
+                Les cercles bleus marquent les {course.waypoints.length} points de
+                passage et leur rayon de validation ({course.waypoints[0]?.radiusMeters} m).
+              </p>
+            )}
             {mapTraces.length === 0 && (
               <p className="text-sm text-slate-500">
-                Aucun tracé à afficher pour cette catégorie.
+                Aucun tracé à afficher pour cette catégorie sur ce parcours.
               </p>
             )}
           </section>
