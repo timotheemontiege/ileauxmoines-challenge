@@ -94,3 +94,11 @@ export async function uploadSession({
   });
   return handle<UploadResponse>(res);
 }
+
+export async function deleteSession(id: string, token: string): Promise<void> {
+  const res = await fetch(`${API_URL}/api/sessions/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  await handle<{ success: boolean }>(res);
+}

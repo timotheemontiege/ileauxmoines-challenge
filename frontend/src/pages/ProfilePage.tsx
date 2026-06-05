@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import {
   CartesianGrid,
@@ -9,7 +9,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { getProfile } from '../lib/api';
+import { deleteSession, getProfile } from '../lib/api';
 import type { ProfileResponse } from '../types';
 import { CATEGORIES, categoryColor, categoryLabel } from '../lib/categories';
 import {
@@ -20,6 +20,7 @@ import {
 } from '../lib/format';
 import CategoryBadge from '../components/CategoryBadge';
 import Spinner from '../components/Spinner';
+import { useAuth } from '../hooks/useAuth';
 
 const STATUS_STYLE: Record<string, string> = {
   valid: 'text-emerald-300 bg-emerald-500/10 border-emerald-500/30',
@@ -29,31 +30,52 @@ const STATUS_STYLE: Record<string, string> = {
 
 export default function ProfilePage() {
   const { username = '' } = useParams();
+  const { user, session } = useAuth();
   const [data, setData] = useState<ProfileResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [chartCategory, setChartCategory] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
+  const load = useCallback(async () => {
     setLoading(true);
     setError(null);
-    setData(null);
-
-    getProfile(username)
-      .then((res) => {
-        if (cancelled) return;
-        setData(res);
-        const cats = Object.keys(res.bestByCategory);
-        setChartCategory(cats[0] ?? null);
-      })
-      .catch((err) => !cancelled && setError((err as Error).message))
-      .finally(() => !cancelled && setLoading(false));
-
-    return () => {
-      cancelled = true;
-    };
+    try {
+      const res = await getProfile(username);
+      setData(res);
+      setChartCategory(Object.keys(res.bestByCategory)[0] ?? null);
+    } catch (err) {
+      setData(null);
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
   }, [username]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // On ne peut supprimer que ses propres traces : on compare les identifiants.
+  const isOwnProfile = !!user && !!data && user.id === data.profile.id;
+
+  async function handleDelete(sessionId: string) {
+    if (!session) return;
+    const ok = window.confirm(
+      'Supprimer cette trace ? Le record associé sera retiré du classement. Cette action est irréversible.',
+    );
+    if (!ok) return;
+    setDeletingId(sessionId);
+    setError(null);
+    try {
+      await deleteSession(sessionId, session.access_token);
+      await load();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setDeletingId(null);
+    }
+  }
 
   const categoriesWithData = data ? Object.keys(data.bestByCategory) : [];
 
@@ -210,6 +232,7 @@ export default function ProfilePage() {
                   <th className="px-4 py-3 font-semibold">Date</th>
                   <th className="px-4 py-3 font-semibold">Statut</th>
                   <th className="px-4 py-3 font-semibold">Points GPS</th>
+                  {isOwnProfile && <th className="px-4 py-3" />}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/70">
@@ -230,6 +253,17 @@ export default function ProfilePage() {
                     <td className="px-4 py-3 text-slate-400">
                       {s.raw_points_count}
                     </td>
+                    {isOwnProfile && (
+                      <td className="px-4 py-3 text-right">
+                        <button
+                          onClick={() => handleDelete(s.id)}
+                          disabled={deletingId === s.id}
+                          className="rounded-lg border border-red-500/40 px-2.5 py-1 text-xs font-medium text-red-300 transition hover:bg-red-500/10 disabled:opacity-50"
+                        >
+                          {deletingId === s.id ? 'Suppression…' : 'Supprimer'}
+                        </button>
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>

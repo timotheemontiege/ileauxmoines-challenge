@@ -168,4 +168,50 @@ router.post('/upload', requireAuth, upload.single('gpx'), async (req, res, next)
   }
 });
 
+// DELETE /api/sessions/:id — supprime une trace de l'utilisateur courant.
+// La suppression de la session retire en cascade sa performance (contrainte FK
+// ON DELETE CASCADE), donc le record disparaît aussi du classement.
+router.delete('/:id', requireAuth, async (req, res, next) => {
+  try {
+    if (!isSupabaseConfigured) {
+      return res.status(503).json({ error: 'Backend non configuré (Supabase manquant)' });
+    }
+
+    const userId = req.user.id;
+    const sessionId = req.params.id;
+
+    const { data: session, error: fetchError } = await supabaseAdmin
+      .from('sessions')
+      .select('id, user_id, gpx_file_url')
+      .eq('id', sessionId)
+      .maybeSingle();
+    if (fetchError) throw new Error(fetchError.message);
+    if (!session) return res.status(404).json({ error: 'Trace introuvable' });
+    if (session.user_id !== userId) {
+      return res
+        .status(403)
+        .json({ error: 'Tu ne peux supprimer que tes propres traces' });
+    }
+
+    // Supprime le fichier GPX du Storage (best-effort : on n'échoue pas s'il manque).
+    if (session.gpx_file_url) {
+      const { error: storageError } = await supabaseAdmin.storage
+        .from(GPX_BUCKET)
+        .remove([session.gpx_file_url]);
+      if (storageError) console.warn('[delete] Storage:', storageError.message);
+    }
+
+    // Supprime la session (cascade -> performances).
+    const { error: deleteError } = await supabaseAdmin
+      .from('sessions')
+      .delete()
+      .eq('id', sessionId);
+    if (deleteError) throw new Error(deleteError.message);
+
+    res.json({ success: true, id: sessionId });
+  } catch (err) {
+    next(err);
+  }
+});
+
 export default router;
