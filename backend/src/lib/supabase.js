@@ -1,6 +1,21 @@
 // Clients Supabase côté backend.
 import { createClient } from '@supabase/supabase-js';
 
+// Node < 22 n'a pas de WebSocket natif : supabase-js/realtime-js le détecte
+// et lève une erreur au démarrage. On lui fournit le package 'ws' comme
+// transport explicite — compatible Node 18, 20, 22+.
+// Sur Node 22+ (WebSocket natif), ws est installé mais non utilisé par défaut
+// car on passe globalThis.WebSocket ?? ws pour éviter la redondance.
+let wsTransport;
+try {
+  // import() dynamique pour ne pas planter si 'ws' n'est pas installé en prod
+  const { default: ws } = await import('ws');
+  // Node 22+ expose globalThis.WebSocket ; on ne remplace que si absent.
+  wsTransport = globalThis.WebSocket ? undefined : ws;
+} catch {
+  wsTransport = undefined; // Node 22+ avec WebSocket natif → pas besoin de ws
+}
+
 const url = process.env.SUPABASE_URL || '';
 const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const anonKey = process.env.SUPABASE_ANON_KEY || '';
@@ -15,6 +30,8 @@ export const GPX_BUCKET = process.env.SUPABASE_GPX_BUCKET || 'gpx';
 // vérifient `isSupabaseConfigured` et renvoient 503 le cas échéant.
 const safeUrl = url || 'http://localhost:54321';
 
+const realtimeOpts = wsTransport ? { transport: wsTransport } : {};
+
 /**
  * Client ADMIN (service_role) : contourne la RLS.
  * Réservé au backend pour écrire en base et gérer le Storage.
@@ -22,6 +39,7 @@ const safeUrl = url || 'http://localhost:54321';
  */
 export const supabaseAdmin = createClient(safeUrl, serviceKey || 'placeholder-service-key', {
   auth: { autoRefreshToken: false, persistSession: false },
+  realtime: realtimeOpts,
 });
 
 /**
@@ -30,4 +48,5 @@ export const supabaseAdmin = createClient(safeUrl, serviceKey || 'placeholder-se
  */
 export const supabaseAnon = createClient(safeUrl, anonKey || 'placeholder-anon-key', {
   auth: { autoRefreshToken: false, persistSession: false },
+  realtime: realtimeOpts,
 });
