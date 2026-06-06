@@ -5,6 +5,7 @@ import HomePage from './pages/HomePage';
 import LeaderboardPage from './pages/LeaderboardPage';
 import SubmitPage from './pages/SubmitPage';
 import ProfilePage from './pages/ProfilePage';
+import TraceDetailPage from './pages/TraceDetailPage';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
 
@@ -26,6 +27,7 @@ export default function App() {
       <Route element={<Layout />}>
         <Route path="/" element={<HomePage />} />
         <Route path="/leaderboard" element={<LeaderboardPage />} />
+        <Route path="/trace/:id" element={<TraceDetailPage />} />
         <Route
           path="/submit"
           element={

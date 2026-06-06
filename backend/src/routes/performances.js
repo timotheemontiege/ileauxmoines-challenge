@@ -118,6 +118,43 @@ router.get('/leaderboard/traces', async (req, res, next) => {
   }
 });
 
+// GET /api/performance/:id — détail d'une trace (carte, Vmax, secteurs).
+router.get('/performance/:id', async (req, res, next) => {
+  try {
+    if (!ensureConfigured(res)) return;
+
+    const { id } = req.params;
+    const { data: perf, error } = await supabaseAdmin
+      .from('performances')
+      .select(
+        'id, session_id, user_id, course_id, duration_seconds, distance_km, avg_speed_knots, vmax_knots, sector_times, category, wind_force_beaufort, comment, start_time, end_time, validated_at, gpx_tour_points',
+      )
+      .eq('id', id)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!perf) return res.status(404).json({ error: 'Trace introuvable' });
+
+    const { data: profile, error: profileError } = await supabaseAdmin
+      .from('profiles')
+      .select('username, avatar_url')
+      .eq('id', perf.user_id)
+      .maybeSingle();
+    if (profileError) throw new Error(profileError.message);
+
+    const course = getCourse(perf.course_id);
+    res.json({
+      performance: {
+        ...perf,
+        username: profile?.username ?? null,
+        avatar_url: profile?.avatar_url ?? null,
+      },
+      courseName: course?.name ?? perf.course_id,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/profile/:username — records par parcours ET par secteur.
 router.get('/profile/:username', async (req, res, next) => {
   try {

@@ -98,6 +98,19 @@ export interface Performance {
   validated_at: string;
 }
 
+/** Détail complet d'une trace (page /trace/:id). */
+export interface PerformanceDetail extends Performance {
+  user_id: string;
+  username: string | null;
+  avatar_url: string | null;
+  gpx_tour_points: TracePoint[];
+}
+
+export interface PerformanceDetailResponse {
+  performance: PerformanceDetail;
+  courseName: string;
+}
+
 export interface SessionRow {
   id: string;
   status: 'pending' | 'valid' | 'invalid';
