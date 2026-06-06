@@ -99,9 +99,11 @@ function buildTour(ctx, i, j, metrics) {
     durationSeconds: metrics.durationSeconds,
     distanceKm: metrics.distanceKm,
     avgSpeedKnots: metrics.avgSpeedKnots,
+    // speedRaw conservé pour permettre la Vmax Doppler ; retiré ensuite de la
+    // polyligne renvoyée (cf. enrichWindingTour) pour ne pas l'alourdir.
     points: ctx.points
       .slice(i, j + 1)
-      .map((p) => ({ lat: p.lat, lon: p.lon, time: p.time })),
+      .map((p) => ({ lat: p.lat, lon: p.lon, time: p.time, speedRaw: p.speedRaw ?? null })),
   };
 }
 
@@ -169,67 +171,172 @@ export function detectAllTours(points, options = {}) {
 // MULTI-PARCOURS : Vmax, secteurs, validation par waypoints, routage detectTour
 // ============================================================================
 
-/** Fenêtre minimale (s) pour la Vmax : lisse les artefacts GPS (dt trop court). */
-const MIN_VMAX_WINDOW_SECONDS = 2;
+// ----------------------------------------------------------------------------
+// Calcul de la Vmax — cascade Doppler → position → nettoyage (Hampel + coupures).
+// Toutes les constantes de réglage sont regroupées ici.
+// ----------------------------------------------------------------------------
+
+/** Fraction minimale de points porteurs d'une vitesse MESURÉE (Doppler) pour
+ *  préférer le NIVEAU 1 (speedRaw) au NIVEAU 2 (calcul par position). */
+const DOPPLER_MIN_COVERAGE = 0.8;
+
+/** Accélération max physiquement plausible entre 2 segments (m/s²). Au-delà =
+ *  saut GPS → le segment est invalidé (NIVEAU 2). 6 m/s² reste très généreux
+ *  pour de la glisse (≈ 0→22 nds en ~2 s). */
+const ACCEL_MAX_MS2 = 6;
+
+/** Filtre de Hampel (médiane glissante robuste, NIVEAU 3) : taille de fenêtre
+ *  (impair) et seuil en nombre d'écarts-types robustes (1.4826·MAD). */
+const HAMPEL_WINDOW = 7;
+const HAMPEL_NSIGMA = 3;
+
+/** Coupure de signal : un intervalle de temps supérieur à ce seuil (s) trahit
+ *  une perte GPS ; les vitesses des points suivants sont parasites (NIVEAU 3). */
+const SIGNAL_GAP_SECONDS = 5;
+/** Nombre de points invalidés juste après une coupure (le saut + sa correction). */
+const GAP_INVALIDATE_POINTS = 2;
+
+/** Garde-fou physique ABSOLU (nds). Ce n'est PAS un plafond « loisir » : c'est
+ *  la borne au-delà de laquelle une vitesse ne peut être qu'un artefact résiduel.
+ *  À monter si tu ajoutes des engins de compétition très rapides (foil race). */
+const VMAX_HARD_CEILING_KNOTS = 50;
+
+/** Marge (nds) au-delà de laquelle Vmax est jugée « suspecte » vs la vitesse
+ *  moyenne du tour. Purement informatif — n'altère JAMAIS la Vmax retournée. */
+const VMAX_SANITY_MARGIN_KNOTS = 15;
+
+const MS_PER_KNOT = 1 / MS_TO_KNOTS;
+
+/** Médiane d'un tableau de nombres (copie triée). NaN si vide. */
+function median(values) {
+  if (values.length === 0) return NaN;
+  const s = values.slice().sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
 
 /**
- * Vitesse maximale instantanée (en nœuds) sur les points [startIndex, endIndex],
- * calculée sur une fenêtre glissante d'AU MOINS minWindowSeconds.
+ * NIVEAUX 1 & 2 — Série de vitesses (m/s), une valeur par point (NaN = invalide).
+ *  - NIVEAU 1 : si la vitesse mesurée (Doppler, point.speedRaw) couvre au moins
+ *    `minCoverage` des points → on l'utilise telle quelle (bien plus fiable que
+ *    le calcul position-à-position).
+ *  - NIVEAU 2 (repli) : vitesse de segment = haversine(Pi-1, Pi) / dt, AVEC un
+ *    filtre d'accélération : tout segment dont |Δv|/dt dépasse accelMax est jugé
+ *    physiquement impossible (saut GPS) et invalidé (NaN) — jamais utilisé pour
+ *    gonfler la Vmax. Les dt ≤ 0 (timestamps dupliqués) sont ignorés.
  *
- * Deux protections complémentaires contre le bruit GPS :
- *  1) REJET DES OUTLIERS : on écarte d'abord tout point dont la vitesse depuis
- *     le dernier point accepté dépasse maxKnots (saut/« téléportation » GPS
- *     physiquement impossible). Cela supprime le pic puis le retour sur la trace.
- *  2) FENÊTRE >= 2 s : pour chaque i, on prend le premier j tel que
- *     (t[j] - t[i]) >= fenêtre, puis vitesse = distance(P_i, P_j) / (t[j] - t[i]).
- *     Exiger >= 2 s élimine les pics dus à deux échantillons trop rapprochés
- *     (dt minuscule -> vitesse absurde).
- * Enfin la Vmax est plafonnée à maxKnots (sécurité).
- * Les points doivent être triés par temps.
+ * @returns {{ series: Float64Array, source: 'doppler'|'position' }}
  */
-export function rejectGpsOutliers(points, maxKnots) {
-  const maxMps = maxKnots / MS_TO_KNOTS;
-  const out = [];
-  for (const p of points) {
-    if (!Number.isFinite(p.time)) continue;
-    if (out.length === 0) {
-      out.push(p);
-      continue;
+export function buildSpeedSeries(points, accelMax = ACCEL_MAX_MS2, minCoverage = DOPPLER_MIN_COVERAGE) {
+  const n = points.length;
+  const series = new Float64Array(n).fill(NaN);
+  const measured = points.reduce((c, p) => c + (Number.isFinite(p?.speedRaw) ? 1 : 0), 0);
+
+  // NIVEAU 1 — Doppler.
+  if (n > 0 && measured / n >= minCoverage) {
+    for (let i = 0; i < n; i++) {
+      if (Number.isFinite(points[i].speedRaw)) series[i] = points[i].speedRaw;
     }
-    const prev = out[out.length - 1];
-    const dt = (p.time - prev.time) / 1000;
-    if (dt <= 0) continue; // timestamps dupliqués/inversés
-    const speed = haversineMeters(prev, p) / dt; // m/s
-    if (speed <= maxMps) out.push(p); // sinon : saut GPS rejeté
+    return { series, source: 'doppler' };
+  }
+
+  // NIVEAU 2 — position + filtre d'accélération.
+  let prevSegV = NaN; // vitesse du segment précédent (mesure le « jerk »)
+  for (let i = 1; i < n; i++) {
+    const dt = (points[i].time - points[i - 1].time) / 1000;
+    if (!(dt > 0)) { prevSegV = NaN; continue; } // dupliqués / non triés
+    const v = haversineMeters(points[i - 1], points[i]) / dt;
+    series[i] = Number.isFinite(prevSegV) && Math.abs(v - prevSegV) / dt > accelMax ? NaN : v;
+    prevSegV = v; // un spike isolé rejette 2 segments (aller + retour) : voulu
+  }
+  if (n > 1 && Number.isFinite(series[1])) series[0] = series[1]; // pt 0 sans amont
+  return { series, source: 'position' };
+}
+
+/**
+ * NIVEAU 3 — Filtre de Hampel. Pour chaque point : médiane + MAD sur la fenêtre
+ * glissante ; si |valeur − médiane| > nSigma·1.4826·MAD → remplacée par la médiane.
+ * Comble aussi les trous (NaN) avec la médiane locale. Retourne une NOUVELLE série.
+ */
+export function hampelFilter(series, windowSize = HAMPEL_WINDOW, nSigma = HAMPEL_NSIGMA) {
+  const n = series.length;
+  const out = Float64Array.from(series);
+  const k = Math.max(1, windowSize >> 1);
+  for (let i = 0; i < n; i++) {
+    const win = [];
+    for (let j = Math.max(0, i - k); j <= Math.min(n - 1, i + k); j++) {
+      if (Number.isFinite(series[j])) win.push(series[j]);
+    }
+    if (win.length === 0) continue;
+    const med = median(win);
+    if (!Number.isFinite(series[i])) { out[i] = med; continue; } // comble le trou
+    const mad = median(win.map((v) => Math.abs(v - med)));
+    const sigma = 1.4826 * mad;
+    if (sigma > 0 && Math.abs(series[i] - med) > nSigma * sigma) out[i] = med;
   }
   return out;
 }
 
-export function computeVmaxKnots(
-  points,
-  startIndex = 0,
-  endIndex = points.length - 1,
-  minWindowSeconds = MIN_VMAX_WINDOW_SECONDS,
-  maxKnots = DEFAULT_DETECTION_OPTIONS.maxSpeedKnots,
-) {
-  // 1) Nettoyage des sauts GPS sur la fenêtre [startIndex, endIndex].
-  const clean = rejectGpsOutliers(points.slice(startIndex, endIndex + 1), maxKnots);
-  if (clean.length < 2) return 0;
-
-  // 2) Fenêtre glissante >= minWindowSeconds (deux pointeurs).
-  let vmax = 0;
-  let j = 0;
-  const last = clean.length - 1;
-  for (let i = 0; i < clean.length; i++) {
-    if (j < i) j = i;
-    while (j < last && (clean[j].time - clean[i].time) / 1000 < minWindowSeconds) j++;
-    const dt = (clean[j].time - clean[i].time) / 1000;
-    if (dt >= minWindowSeconds) {
-      const knots = (haversineMeters(clean[i], clean[j]) / dt) * MS_TO_KNOTS;
-      if (knots > vmax && knots <= maxKnots) vmax = knots; // 3) plafond réaliste
+/**
+ * NIVEAU 3 — Rejet des reprises après coupure de signal. Un dt > gapSeconds
+ * trahit une perte GPS ; à la reprise, le saut de position (ou un Doppler
+ * réacquis) ment. On invalide (NaN) les `invalidate` points suivant le trou.
+ * Mute la série passée et la retourne.
+ */
+export function rejectSignalGaps(points, series, gapSeconds = SIGNAL_GAP_SECONDS, invalidate = GAP_INVALIDATE_POINTS) {
+  for (let i = 1; i < points.length; i++) {
+    const dt = (points[i].time - points[i - 1].time) / 1000;
+    if (dt > gapSeconds) {
+      for (let k = 0; k < invalidate && i + k < series.length; k++) series[i + k] = NaN;
     }
   }
-  return vmax;
+  return series;
+}
+
+/**
+ * Vmax robuste (cascade complète) + métadonnées de diagnostic.
+ * @returns {{ vmaxKnots:number, source:'doppler'|'position', cleanCount:number }}
+ */
+export function computeVmaxDetailed(points, startIndex = 0, endIndex = points.length - 1) {
+  const slice = points.slice(startIndex, endIndex + 1);
+  if (slice.length < 2) return { vmaxKnots: 0, source: 'position', cleanCount: 0 };
+
+  const { series, source } = buildSpeedSeries(slice); // NIVEAU 1 ou 2
+  const cleaned = hampelFilter(series); // NIVEAU 3 — outliers robustes
+  rejectSignalGaps(slice, cleaned); // NIVEAU 3 — coupures de signal
+
+  // Max robuste, sous le garde-fou physique absolu.
+  const ceil = VMAX_HARD_CEILING_KNOTS * MS_PER_KNOT;
+  let vmax = 0;
+  let cleanCount = 0;
+  for (const v of cleaned) {
+    if (Number.isFinite(v) && v <= ceil) {
+      cleanCount++;
+      if (v > vmax) vmax = v;
+    }
+  }
+  return { vmaxKnots: vmax * MS_TO_KNOTS, source, cleanCount };
+}
+
+/**
+ * Vitesse maximale instantanée (nœuds) sur [startIndex, endIndex], via la cascade
+ * Doppler → position → Hampel → rejet des coupures. Les points doivent être triés
+ * par temps et porter {lat, lon, time[, speedRaw]}.
+ */
+export function computeVmaxKnots(points, startIndex = 0, endIndex = points.length - 1) {
+  return computeVmaxDetailed(points, startIndex, endIndex).vmaxKnots;
+}
+
+/**
+ * Contrôle de cohérence (sanity check) : Vmax suspecte si elle dépasse la vitesse
+ * moyenne de plus de `margin` nœuds. Informatif uniquement.
+ */
+export function isVmaxSuspect(vmaxKnots, avgSpeedKnots, margin = VMAX_SANITY_MARGIN_KNOTS) {
+  return (
+    Number.isFinite(vmaxKnots) &&
+    Number.isFinite(avgSpeedKnots) &&
+    vmaxKnots > avgSpeedKnots + margin
+  );
 }
 
 /** Secteur « vide » (borne non atteinte) pour un découpage incomplet. */
@@ -370,7 +477,7 @@ export function detectByWaypoints(points, courseConfig, options = {}) {
     distanceM += haversineMeters(pts[i - 1], pts[i]);
   }
   const avgSpeedKnots = durationSeconds > 0 ? (distanceM / durationSeconds) * MS_TO_KNOTS : 0;
-  const vmaxKnots = computeVmaxKnots(pts, startIndex, endIndex);
+  const vm = computeVmaxDetailed(pts, startIndex, endIndex); // pts portent speedRaw
 
   // Secteurs = intervalles entre waypoints consécutifs.
   const sectors = courseConfig.sectors.map((s) => {
@@ -394,7 +501,9 @@ export function detectByWaypoints(points, courseConfig, options = {}) {
     durationSeconds,
     distanceKm: distanceM / 1000,
     avgSpeedKnots,
-    vmaxKnots,
+    vmaxKnots: vm.vmaxKnots,
+    vmaxSource: vm.source, // 'doppler' | 'position' (diagnostic)
+    vmaxSuspect: isVmaxSuspect(vm.vmaxKnots, avgSpeedKnots),
     sectors,
     points: pts.slice(startIndex, endIndex + 1).map((p) => ({ lat: p.lat, lon: p.lon, time: p.time })),
   };
@@ -404,8 +513,12 @@ export function detectByWaypoints(points, courseConfig, options = {}) {
 
 /** Ajoute Vmax + découpage en secteurs à un tour « winding » déjà détecté. */
 function enrichWindingTour(tour, courseConfig) {
-  tour.vmaxKnots = computeVmaxKnots(tour.points, 0, tour.points.length - 1);
+  const vm = computeVmaxDetailed(tour.points, 0, tour.points.length - 1);
+  tour.vmaxKnots = vm.vmaxKnots;
+  tour.vmaxSource = vm.source; // 'doppler' | 'position' (diagnostic)
+  tour.vmaxSuspect = isVmaxSuspect(vm.vmaxKnots, tour.avgSpeedKnots);
   tour.sectors = buildWindingSectors(courseConfig, tour.points);
+  for (const p of tour.points) delete p.speedRaw; // allège la polyligne renvoyée
   return tour;
 }
 
@@ -498,7 +611,11 @@ export default {
   detectByWindingNumber,
   detectByWaypoints,
   computeVmaxKnots,
-  rejectGpsOutliers,
+  computeVmaxDetailed,
+  buildSpeedSeries,
+  hampelFilter,
+  rejectSignalGaps,
+  isVmaxSuspect,
   buildWindingSectors,
   findOrderedPassages,
 };
