@@ -169,22 +169,51 @@ export function detectAllTours(points, options = {}) {
 // MULTI-PARCOURS : Vmax, secteurs, validation par waypoints, routage detectTour
 // ============================================================================
 
-/** Fenêtre minimale (s) pour la Vmax : lisse les artefacts GPS (dt trop court). */
+/** Fenêtre minimale (s) pour la Vmax. */
 const MIN_VMAX_WINDOW_SECONDS = 2;
+
+/**
+ * Seuil de rejet des outliers GPS pour le calcul Vmax.
+ * Délibérément plus bas que DEFAULT_DETECTION_OPTIONS.maxSpeedKnots (60) :
+ * le tour peut se valider sur une vitesse MOYENNE ≤ 60 nds, mais aucun
+ * engin de loisir ne dépasse ~40 nds en pointe dans le Golfe.
+ * Ajuste cette valeur si tu ajoutes des foils de compétition très rapides.
+ */
+const VMAX_OUTLIER_MAX_KNOTS = 40;
+
+/**
+ * Filtre médian 3 points sur les positions d'une trace GPS.
+ * Élimine les points « téléportés » isolés (erreur multipath, perte satellite)
+ * sans déformer la trajectoire réelle : le médian de [A, outlier, B] ≈ A ou B.
+ * Les timestamps restent inchangés ; seules lat/lon sont lissées.
+ */
+export function medianFilterPositions(points) {
+  const n = points.length;
+  if (n < 3) return points.slice();
+  const out = new Array(n);
+  out[0] = points[0];
+  out[n - 1] = points[n - 1];
+  for (let i = 1; i < n - 1; i++) {
+    const lats = [points[i - 1].lat, points[i].lat, points[i + 1].lat].sort((a, b) => a - b);
+    const lons = [points[i - 1].lon, points[i].lon, points[i + 1].lon].sort((a, b) => a - b);
+    out[i] = { ...points[i], lat: lats[1], lon: lons[1] }; // valeur médiane
+  }
+  return out;
+}
 
 /**
  * Vitesse maximale instantanée (en nœuds) sur les points [startIndex, endIndex],
  * calculée sur une fenêtre glissante d'AU MOINS minWindowSeconds.
  *
- * Deux protections complémentaires contre le bruit GPS :
- *  1) REJET DES OUTLIERS : on écarte d'abord tout point dont la vitesse depuis
- *     le dernier point accepté dépasse maxKnots (saut/« téléportation » GPS
- *     physiquement impossible). Cela supprime le pic puis le retour sur la trace.
- *  2) FENÊTRE >= 2 s : pour chaque i, on prend le premier j tel que
- *     (t[j] - t[i]) >= fenêtre, puis vitesse = distance(P_i, P_j) / (t[j] - t[i]).
- *     Exiger >= 2 s élimine les pics dus à deux échantillons trop rapprochés
- *     (dt minuscule -> vitesse absurde).
- * Enfin la Vmax est plafonnée à maxKnots (sécurité).
+ * Pipeline de calcul robuste en 3 étapes :
+ *  1) FILTRE MÉDIAN 3 pts : remplace la position de chaque point par la médiane
+ *     de ses voisins (élimine les points « téléportés » isolés sans déformer
+ *     la trajectoire — le principal responsable de Vmax gonflées sur GPS 1 Hz).
+ *  2) REJET DES OUTLIERS résiduels : écarte tout point dont la vitesse depuis
+ *     le dernier accepté dépasse vmaxOutlierKnots (= 40 nds par défaut, seuil
+ *     physiquement impossible dans le Golfe pour du loisir).
+ *  3) FENÊTRE GLISSANTE >= 2 s : vitesse = distance(Pi, Pj) / (tj - ti).
+ *     La fenêtre lisse les micro-sauts résiduels et reflète une vitesse tenue.
  * Les points doivent être triés par temps.
  */
 export function rejectGpsOutliers(points, maxKnots) {
@@ -192,15 +221,11 @@ export function rejectGpsOutliers(points, maxKnots) {
   const out = [];
   for (const p of points) {
     if (!Number.isFinite(p.time)) continue;
-    if (out.length === 0) {
-      out.push(p);
-      continue;
-    }
+    if (out.length === 0) { out.push(p); continue; }
     const prev = out[out.length - 1];
     const dt = (p.time - prev.time) / 1000;
-    if (dt <= 0) continue; // timestamps dupliqués/inversés
-    const speed = haversineMeters(prev, p) / dt; // m/s
-    if (speed <= maxMps) out.push(p); // sinon : saut GPS rejeté
+    if (dt <= 0) continue;
+    if (haversineMeters(prev, p) / dt <= maxMps) out.push(p);
   }
   return out;
 }
@@ -210,13 +235,19 @@ export function computeVmaxKnots(
   startIndex = 0,
   endIndex = points.length - 1,
   minWindowSeconds = MIN_VMAX_WINDOW_SECONDS,
-  maxKnots = DEFAULT_DETECTION_OPTIONS.maxSpeedKnots,
+  vmaxOutlierKnots = VMAX_OUTLIER_MAX_KNOTS,
 ) {
-  // 1) Nettoyage des sauts GPS sur la fenêtre [startIndex, endIndex].
-  const clean = rejectGpsOutliers(points.slice(startIndex, endIndex + 1), maxKnots);
+  const slice = points.slice(startIndex, endIndex + 1);
+
+  // 1) Filtre médian : supprime les pics GPS isolés (principal coupable).
+  const smoothed = medianFilterPositions(slice);
+
+  // 2) Rejet des outliers résiduels (seuil 40 nds, plus conservateur que les 60
+  //    nds du filtre de détection du tour).
+  const clean = rejectGpsOutliers(smoothed, vmaxOutlierKnots);
   if (clean.length < 2) return 0;
 
-  // 2) Fenêtre glissante >= minWindowSeconds (deux pointeurs).
+  // 3) Fenêtre glissante >= 2 s sur la trace nettoyée.
   let vmax = 0;
   let j = 0;
   const last = clean.length - 1;
@@ -226,7 +257,7 @@ export function computeVmaxKnots(
     const dt = (clean[j].time - clean[i].time) / 1000;
     if (dt >= minWindowSeconds) {
       const knots = (haversineMeters(clean[i], clean[j]) / dt) * MS_TO_KNOTS;
-      if (knots > vmax && knots <= maxKnots) vmax = knots; // 3) plafond réaliste
+      if (knots > vmax && knots <= vmaxOutlierKnots) vmax = knots;
     }
   }
   return vmax;
@@ -499,6 +530,7 @@ export default {
   detectByWaypoints,
   computeVmaxKnots,
   rejectGpsOutliers,
+  medianFilterPositions,
   buildWindingSectors,
   findOrderedPassages,
 };
