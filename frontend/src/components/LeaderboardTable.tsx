@@ -1,4 +1,4 @@
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import type { LeaderboardEntry } from '../types';
 import { formatDate, formatDistance, formatDuration, formatSpeed } from '../lib/format';
 import CategoryBadge from './CategoryBadge';
@@ -13,6 +13,7 @@ export default function LeaderboardTable({
   entries: LeaderboardEntry[];
   startRank?: number;
 }) {
+  const navigate = useNavigate();
   if (entries.length === 0) {
     return (
       <div className="card p-8 text-center text-slate-400">
@@ -40,7 +41,12 @@ export default function LeaderboardTable({
           {entries.map((e, i) => {
             const rank = e.rank ?? startRank + i;
             return (
-              <tr key={e.performance_id} className="hover:bg-slate-800/40">
+              <tr
+                key={e.performance_id}
+                onClick={() => navigate(`/trace/${e.performance_id}`)}
+                className="cursor-pointer hover:bg-slate-800/40"
+                title="Voir le détail de la trace"
+              >
                 <td className="px-4 py-3 font-mono font-semibold text-slate-300">
                   <span className="mr-1">{medal(rank)}</span>
                   {rank}
@@ -48,6 +54,7 @@ export default function LeaderboardTable({
                 <td className="px-4 py-3">
                   <Link
                     to={`/profile/${e.username}`}
+                    onClick={(ev) => ev.stopPropagation()}
                     className="font-medium text-ocean-300 hover:text-ocean-200"
                   >
                     {e.username}

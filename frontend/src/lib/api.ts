@@ -1,5 +1,6 @@
 import type {
   LeaderboardResponse,
+  PerformanceDetailResponse,
   ProfileResponse,
   SectorLeaderboardResponse,
   TraceRecord,
@@ -77,6 +78,15 @@ export async function getLeaderboardTraces(query: {
   );
   const data = await handle<{ traces: TraceRecord[] }>(res);
   return data.traces;
+}
+
+export async function getPerformance(
+  id: string,
+): Promise<PerformanceDetailResponse> {
+  const res = await fetch(
+    `${API_URL}/api/performance/${encodeURIComponent(id)}`,
+  );
+  return handle<PerformanceDetailResponse>(res);
 }
 
 export async function getProfile(username: string): Promise<ProfileResponse> {

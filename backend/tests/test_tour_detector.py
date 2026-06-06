@@ -197,20 +197,45 @@ def detect_all_tours(points, opts=None):
 # ============================================================================
 # Vmax (fenêtre glissante >= 2 s)
 # ============================================================================
-def compute_vmax_knots(points, start_index=0, end_index=None, min_window=MIN_VMAX_WINDOW_SECONDS):
+def reject_gps_outliers(points, max_knots):
+    """Écarte les points dont la vitesse depuis le dernier point accepté
+    dépasse max_knots (saut/téléportation GPS physiquement impossible)."""
+    max_mps = max_knots / MS_TO_KNOTS
+    out = []
+    for p in points:
+        if p.get("time") is None:
+            continue
+        if not out:
+            out.append(p)
+            continue
+        prev = out[-1]
+        dt = (p["time"] - prev["time"]) / 1000.0
+        if dt <= 0:
+            continue
+        if haversine_meters(prev, p) / dt <= max_mps:
+            out.append(p)
+    return out
+
+
+def compute_vmax_knots(points, start_index=0, end_index=None,
+                       min_window=MIN_VMAX_WINDOW_SECONDS, max_knots=60):
     if end_index is None:
         end_index = len(points) - 1
+    clean = reject_gps_outliers(points[start_index:end_index + 1], max_knots)
+    if len(clean) < 2:
+        return 0.0
     vmax = 0.0
-    j = start_index
-    for i in range(start_index, end_index + 1):
+    j = 0
+    last = len(clean) - 1
+    for i in range(len(clean)):
         if j < i:
             j = i
-        while j < end_index and (points[j]["time"] - points[i]["time"]) / 1000.0 < min_window:
+        while j < last and (clean[j]["time"] - clean[i]["time"]) / 1000.0 < min_window:
             j += 1
-        dt = (points[j]["time"] - points[i]["time"]) / 1000.0
+        dt = (clean[j]["time"] - clean[i]["time"]) / 1000.0
         if dt >= min_window:
-            knots = (haversine_meters(points[i], points[j]) / dt) * MS_TO_KNOTS
-            if knots > vmax:
+            knots = (haversine_meters(clean[i], clean[j]) / dt) * MS_TO_KNOTS
+            if knots > vmax and knots <= max_knots:
                 vmax = knots
     return vmax
 
@@ -493,6 +518,22 @@ class TestVmax(unittest.TestCase):
         vmax = compute_vmax_knots(track)
         self.assertGreater(vmax, 18)
         self.assertLess(vmax, 22)
+
+    def test_saut_gps_rejete(self):
+        # Bug réel rapporté : un point qui "téléporte" à 300 m puis revient
+        # gonfle la Vmax. Le rejet d'outliers doit l'écarter.
+        track = make_linear_speed_track([(5 * KN, 20, 1.0)])
+        teleport = dict(track[10])
+        teleport["lon"] = track[10]["lon"] + 0.004  # ~300 m de côté en 1 s
+        track.insert(11, teleport)
+        track.sort(key=lambda p: p["time"])
+        vmax = compute_vmax_knots(track)
+        self.assertLess(vmax, 8)  # le saut est rejeté, on reste à ~5 nds
+
+    def test_plafond_realiste(self):
+        # Une trace entièrement à 200 nœuds (impossible) est plafonnée/rejetée.
+        track = make_linear_speed_track([(200 * KN, 10, 1.0)])
+        self.assertLessEqual(compute_vmax_knots(track, max_knots=60), 60)
 
     def test_blip_1s_attenue(self):
         # Un pic de 40 nœuds tenu 1 s est un déplacement réel, mais la fenêtre

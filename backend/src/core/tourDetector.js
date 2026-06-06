@@ -176,27 +176,57 @@ const MIN_VMAX_WINDOW_SECONDS = 2;
  * Vitesse maximale instantanée (en nœuds) sur les points [startIndex, endIndex],
  * calculée sur une fenêtre glissante d'AU MOINS minWindowSeconds.
  *
- * Pour chaque point i, on prend le premier j tel que (t[j] - t[i]) >= fenêtre,
- * puis vitesse = distance(P_i, P_j) / (t[j] - t[i]). Exiger >= 2 s élimine les
- * pics dus à deux échantillons trop rapprochés (dt minuscule -> vitesse absurde),
- * tout en conservant une accélération réellement tenue sur 2 s ou plus.
+ * Deux protections complémentaires contre le bruit GPS :
+ *  1) REJET DES OUTLIERS : on écarte d'abord tout point dont la vitesse depuis
+ *     le dernier point accepté dépasse maxKnots (saut/« téléportation » GPS
+ *     physiquement impossible). Cela supprime le pic puis le retour sur la trace.
+ *  2) FENÊTRE >= 2 s : pour chaque i, on prend le premier j tel que
+ *     (t[j] - t[i]) >= fenêtre, puis vitesse = distance(P_i, P_j) / (t[j] - t[i]).
+ *     Exiger >= 2 s élimine les pics dus à deux échantillons trop rapprochés
+ *     (dt minuscule -> vitesse absurde).
+ * Enfin la Vmax est plafonnée à maxKnots (sécurité).
  * Les points doivent être triés par temps.
  */
+export function rejectGpsOutliers(points, maxKnots) {
+  const maxMps = maxKnots / MS_TO_KNOTS;
+  const out = [];
+  for (const p of points) {
+    if (!Number.isFinite(p.time)) continue;
+    if (out.length === 0) {
+      out.push(p);
+      continue;
+    }
+    const prev = out[out.length - 1];
+    const dt = (p.time - prev.time) / 1000;
+    if (dt <= 0) continue; // timestamps dupliqués/inversés
+    const speed = haversineMeters(prev, p) / dt; // m/s
+    if (speed <= maxMps) out.push(p); // sinon : saut GPS rejeté
+  }
+  return out;
+}
+
 export function computeVmaxKnots(
   points,
   startIndex = 0,
   endIndex = points.length - 1,
   minWindowSeconds = MIN_VMAX_WINDOW_SECONDS,
+  maxKnots = DEFAULT_DETECTION_OPTIONS.maxSpeedKnots,
 ) {
+  // 1) Nettoyage des sauts GPS sur la fenêtre [startIndex, endIndex].
+  const clean = rejectGpsOutliers(points.slice(startIndex, endIndex + 1), maxKnots);
+  if (clean.length < 2) return 0;
+
+  // 2) Fenêtre glissante >= minWindowSeconds (deux pointeurs).
   let vmax = 0;
-  let j = startIndex;
-  for (let i = startIndex; i <= endIndex; i++) {
+  let j = 0;
+  const last = clean.length - 1;
+  for (let i = 0; i < clean.length; i++) {
     if (j < i) j = i;
-    while (j < endIndex && (points[j].time - points[i].time) / 1000 < minWindowSeconds) j++;
-    const dt = (points[j].time - points[i].time) / 1000;
+    while (j < last && (clean[j].time - clean[i].time) / 1000 < minWindowSeconds) j++;
+    const dt = (clean[j].time - clean[i].time) / 1000;
     if (dt >= minWindowSeconds) {
-      const knots = (haversineMeters(points[i], points[j]) / dt) * MS_TO_KNOTS;
-      if (knots > vmax) vmax = knots;
+      const knots = (haversineMeters(clean[i], clean[j]) / dt) * MS_TO_KNOTS;
+      if (knots > vmax && knots <= maxKnots) vmax = knots; // 3) plafond réaliste
     }
   }
   return vmax;
@@ -468,6 +498,7 @@ export default {
   detectByWindingNumber,
   detectByWaypoints,
   computeVmaxKnots,
+  rejectGpsOutliers,
   buildWindingSectors,
   findOrderedPassages,
 };

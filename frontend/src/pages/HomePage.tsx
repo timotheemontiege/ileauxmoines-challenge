@@ -26,7 +26,8 @@ export default function HomePage() {
 
     Promise.all([
       getLeaderboard({ course: courseId, category, period: 'all', pageSize: 10 }),
-      getLeaderboardTraces({ course: courseId, category, period: 'all', limit: 20 }),
+      // Carte : uniquement le meilleur itinéraire du classement (n°1).
+      getLeaderboardTraces({ course: courseId, category, period: 'all', limit: 1 }),
     ])
       .then(([board, tr]) => {
         if (cancelled) return;
@@ -113,10 +114,10 @@ export default function HomePage() {
             </section>
           )}
 
-          {/* Filtre + carte */}
+          {/* Filtre + carte : meilleur itinéraire */}
           <section className="space-y-5">
             <div className="flex flex-wrap items-center justify-between gap-4">
-              <h2 className="text-xl font-bold">🗺️ Tracés des records</h2>
+              <h2 className="text-xl font-bold">🗺️ Meilleur itinéraire</h2>
               <Filters
                 category={category}
                 onCategoryChange={setCategory}
@@ -131,12 +132,22 @@ export default function HomePage() {
               waypoints={mapWaypoints}
               showWaypointRadius={isWaypointCourse}
             />
-            {isWaypointCourse && (
-              <p className="text-sm text-slate-500">
-                Les cercles bleus marquent les {course.waypoints.length} points de
-                passage et leur rayon de validation ({course.waypoints[0]?.radiusMeters} m).
-              </p>
-            )}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              {isWaypointCourse && (
+                <p className="text-sm text-slate-500">
+                  Les cercles bleus marquent les {course.waypoints.length} points de
+                  passage et leur rayon de validation ({course.waypoints[0]?.radiusMeters} m).
+                </p>
+              )}
+              {traces[0] && (
+                <Link
+                  to={`/trace/${traces[0].performance_id}`}
+                  className="text-sm text-ocean-300 hover:text-ocean-200"
+                >
+                  Détail du meilleur tour ({traces[0].username}) →
+                </Link>
+              )}
+            </div>
             {mapTraces.length === 0 && (
               <p className="text-sm text-slate-500">
                 Aucun tracé à afficher pour cette catégorie sur ce parcours.
