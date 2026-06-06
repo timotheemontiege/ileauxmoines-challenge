@@ -150,7 +150,8 @@ def build_tour(ctx, i, j, m):
         "durationSeconds": m["durationSeconds"],
         "distanceKm": m["distanceKm"],
         "avgSpeedKnots": m["avgSpeedKnots"],
-        "points": [{"lat": p["lat"], "lon": p["lon"], "time": p["time"]} for p in pts],
+        # speedRaw conservé pour permettre la Vmax Doppler (retiré ensuite).
+        "points": [{"lat": p["lat"], "lon": p["lon"], "time": p["time"], "speedRaw": p.get("speedRaw")} for p in pts],
     }
 
 
@@ -195,70 +196,120 @@ def detect_all_tours(points, opts=None):
 
 
 # ============================================================================
-# Vmax (fenêtre glissante >= 2 s)
+# Vmax — cascade Doppler -> position -> nettoyage (miroir tourDetector.js)
 # ============================================================================
-VMAX_OUTLIER_MAX_KNOTS = 40  # seuil de rejet outliers pour la Vmax
+DOPPLER_MIN_COVERAGE = 0.8   # part de points avec vitesse mesurée -> NIVEAU 1
+ACCEL_MAX_MS2 = 6.0          # accélération max plausible (NIVEAU 2)
+HAMPEL_WINDOW = 7            # fenêtre du filtre de Hampel (NIVEAU 3)
+HAMPEL_NSIGMA = 3
+SIGNAL_GAP_SECONDS = 5       # dt au-delà = coupure de signal (NIVEAU 3)
+GAP_INVALIDATE_POINTS = 2
+VMAX_HARD_CEILING_KNOTS = 50  # garde-fou physique absolu (pas un cap loisir)
+VMAX_SANITY_MARGIN_KNOTS = 15
+MS_PER_KNOT = 1.0 / MS_TO_KNOTS
+NAN = float("nan")
 
 
-def median_filter_positions(points):
-    """Filtre médian 3 points : supprime les pics GPS isolés."""
+def _median(values):
+    s = sorted(values)
+    n = len(s)
+    if n == 0:
+        return NAN
+    m = n // 2
+    return s[m] if n % 2 else (s[m - 1] + s[m]) / 2.0
+
+
+def build_speed_series(points, accel_max=ACCEL_MAX_MS2, min_coverage=DOPPLER_MIN_COVERAGE):
+    """NIVEAUX 1 & 2 : série de vitesses (m/s), une par point (NaN = invalide)."""
     n = len(points)
-    if n < 3:
-        return list(points)
-    out = [None] * n
-    out[0] = points[0]
-    out[-1] = points[-1]
-    for i in range(1, n - 1):
-        lats = sorted([points[i - 1]["lat"], points[i]["lat"], points[i + 1]["lat"]])
-        lons = sorted([points[i - 1]["lon"], points[i]["lon"], points[i + 1]["lon"]])
-        out[i] = {**points[i], "lat": lats[1], "lon": lons[1]}
+    series = [NAN] * n
+    measured = sum(1 for p in points
+                   if p.get("speedRaw") is not None and math.isfinite(p["speedRaw"]))
+    # NIVEAU 1 — Doppler.
+    if n > 0 and measured / n >= min_coverage:
+        for i, p in enumerate(points):
+            sr = p.get("speedRaw")
+            if sr is not None and math.isfinite(sr):
+                series[i] = sr
+        return series, "doppler"
+    # NIVEAU 2 — position + filtre d'accélération.
+    prev_seg_v = NAN
+    for i in range(1, n):
+        dt = (points[i]["time"] - points[i - 1]["time"]) / 1000.0
+        if not (dt > 0):
+            prev_seg_v = NAN
+            continue
+        v = haversine_meters(points[i - 1], points[i]) / dt
+        if math.isfinite(prev_seg_v) and abs(v - prev_seg_v) / dt > accel_max:
+            series[i] = NAN
+        else:
+            series[i] = v
+        prev_seg_v = v
+    if n > 1 and math.isfinite(series[1]):
+        series[0] = series[1]
+    return series, "position"
+
+
+def hampel_filter(series, window_size=HAMPEL_WINDOW, n_sigma=HAMPEL_NSIGMA):
+    """NIVEAU 3 — médiane glissante robuste ; comble aussi les trous (NaN)."""
+    n = len(series)
+    out = list(series)
+    k = max(1, window_size // 2)
+    for i in range(n):
+        win = [series[j] for j in range(max(0, i - k), min(n - 1, i + k) + 1)
+               if math.isfinite(series[j])]
+        if not win:
+            continue
+        med = _median(win)
+        if not math.isfinite(series[i]):
+            out[i] = med
+            continue
+        mad = _median([abs(v - med) for v in win])
+        sigma = 1.4826 * mad
+        if sigma > 0 and abs(series[i] - med) > n_sigma * sigma:
+            out[i] = med
     return out
 
 
-def reject_gps_outliers(points, max_knots):
-    max_mps = max_knots / MS_TO_KNOTS
-    out = []
-    for p in points:
-        if p.get("time") is None:
-            continue
-        if not out:
-            out.append(p)
-            continue
-        prev = out[-1]
-        dt = (p["time"] - prev["time"]) / 1000.0
-        if dt <= 0:
-            continue
-        if haversine_meters(prev, p) / dt <= max_mps:
-            out.append(p)
-    return out
+def reject_signal_gaps(points, series, gap_seconds=SIGNAL_GAP_SECONDS,
+                       invalidate=GAP_INVALIDATE_POINTS):
+    """NIVEAU 3 — invalide les vitesses des points suivant une coupure de signal."""
+    for i in range(1, len(points)):
+        dt = (points[i]["time"] - points[i - 1]["time"]) / 1000.0
+        if dt > gap_seconds:
+            for k in range(invalidate):
+                if i + k < len(series):
+                    series[i + k] = NAN
+    return series
 
 
-def compute_vmax_knots(points, start_index=0, end_index=None,
-                       min_window=MIN_VMAX_WINDOW_SECONDS,
-                       vmax_outlier_knots=VMAX_OUTLIER_MAX_KNOTS):
+def compute_vmax_detailed(points, start_index=0, end_index=None):
     if end_index is None:
         end_index = len(points) - 1
-    # 1) filtre médian
-    smoothed = median_filter_positions(points[start_index:end_index + 1])
-    # 2) rejet outliers résiduels (seuil 40 nds)
-    clean = reject_gps_outliers(smoothed, vmax_outlier_knots)
-    if len(clean) < 2:
-        return 0.0
-    # 3) fenêtre glissante 2 s
+    sl = points[start_index:end_index + 1]
+    if len(sl) < 2:
+        return {"vmaxKnots": 0.0, "source": "position", "cleanCount": 0}
+    series, source = build_speed_series(sl)
+    cleaned = hampel_filter(series)
+    reject_signal_gaps(sl, cleaned)
+    ceil = VMAX_HARD_CEILING_KNOTS * MS_PER_KNOT
     vmax = 0.0
-    j = 0
-    last = len(clean) - 1
-    for i in range(len(clean)):
-        if j < i:
-            j = i
-        while j < last and (clean[j]["time"] - clean[i]["time"]) / 1000.0 < min_window:
-            j += 1
-        dt = (clean[j]["time"] - clean[i]["time"]) / 1000.0
-        if dt >= min_window:
-            knots = (haversine_meters(clean[i], clean[j]) / dt) * MS_TO_KNOTS
-            if knots > vmax and knots <= vmax_outlier_knots:
-                vmax = knots
-    return vmax
+    clean_count = 0
+    for v in cleaned:
+        if math.isfinite(v) and v <= ceil:
+            clean_count += 1
+            if v > vmax:
+                vmax = v
+    return {"vmaxKnots": vmax * MS_TO_KNOTS, "source": source, "cleanCount": clean_count}
+
+
+def compute_vmax_knots(points, start_index=0, end_index=None):
+    return compute_vmax_detailed(points, start_index, end_index)["vmaxKnots"]
+
+
+def is_vmax_suspect(vmax_knots, avg_speed_knots, margin=VMAX_SANITY_MARGIN_KNOTS):
+    return (math.isfinite(vmax_knots) and math.isfinite(avg_speed_knots)
+            and vmax_knots > avg_speed_knots + margin)
 
 
 # ============================================================================
@@ -373,7 +424,7 @@ def detect_by_waypoints(points, course, opts=None):
     duration = (end_time - start_time) / 1000.0
     dist_m = sum(haversine_meters(pts[i - 1], pts[i]) for i in range(start_index + 1, end_index + 1))
     avg = (dist_m / duration) * MS_TO_KNOTS if duration > 0 else 0.0
-    vmax = compute_vmax_knots(pts, start_index, end_index)
+    vm = compute_vmax_detailed(pts, start_index, end_index)  # pts portent speedRaw
 
     sectors = []
     for s in course["sectors"]:
@@ -392,7 +443,9 @@ def detect_by_waypoints(points, course, opts=None):
         "startIndex": start_index, "endIndex": end_index,
         "startTime": start_time, "endTime": end_time,
         "durationSeconds": duration, "distanceKm": dist_m / 1000.0,
-        "avgSpeedKnots": avg, "vmaxKnots": vmax, "sectors": sectors,
+        "avgSpeedKnots": avg, "vmaxKnots": vm["vmaxKnots"],
+        "vmaxSource": vm["source"], "vmaxSuspect": is_vmax_suspect(vm["vmaxKnots"], avg),
+        "sectors": sectors,
         "points": [{"lat": p["lat"], "lon": p["lon"], "time": p["time"]} for p in pts[start_index:end_index + 1]],
     }
     return {"valid": True, "bestTour": best, "allTours": [best]}
@@ -404,8 +457,13 @@ def detect_tour(points, course):
     best = detect_best_tour(points, {"center": course["centroid"], "bbox": course["boundingBox"]})
     if not best:
         return {"valid": False, "bestTour": None, "allTours": []}
-    best["vmaxKnots"] = compute_vmax_knots(best["points"], 0, len(best["points"]) - 1)
+    vm = compute_vmax_detailed(best["points"], 0, len(best["points"]) - 1)
+    best["vmaxKnots"] = vm["vmaxKnots"]
+    best["vmaxSource"] = vm["source"]
+    best["vmaxSuspect"] = is_vmax_suspect(vm["vmaxKnots"], best["avgSpeedKnots"])
     best["sectors"] = build_winding_sectors(course, best["points"])
+    for p in best["points"]:
+        p.pop("speedRaw", None)  # allège la polyligne renvoyée
     return {"valid": True, "bestTour": best, "allTours": [best]}
 
 
@@ -480,6 +538,11 @@ def make_linear_speed_track(segments, start_ms=1_700_000_000_000, lat=47.60, lon
     return pts
 
 
+def with_doppler(track, speed_mps):
+    """Attache une vitesse MESURÉE (Doppler) à chaque point d'une trace."""
+    return [dict(p, speedRaw=speed_mps) for p in track]
+
+
 KN = 1.0 / MS_TO_KNOTS  # 1 nœud en m/s
 
 
@@ -520,67 +583,108 @@ class TestWinding(unittest.TestCase):
 
 
 class TestVmax(unittest.TestCase):
+    # --- NIVEAU 1 : Doppler ---------------------------------------------------
+    def test_doppler_prioritaire(self):
+        # Positions ~6 nds, mais Doppler mesuré = 12 nds sur TOUS les points.
+        # Vmax doit valoir le champ mesuré (12), PAS le calcul position (6).
+        track = with_doppler(make_linear_speed_track([(6 * KN, 30, 1.0)]), 12 * KN)
+        detailed = compute_vmax_detailed(track)
+        self.assertEqual(detailed["source"], "doppler")
+        self.assertAlmostEqual(detailed["vmaxKnots"], 12.0, delta=0.2)
+
+    def test_sans_vitesse_niveau2(self):
+        # Trace sans champ vitesse -> bascule en NIVEAU 2 (calcul par position).
+        track = make_linear_speed_track([(10 * KN, 20, 1.0)])
+        detailed = compute_vmax_detailed(track)
+        self.assertEqual(detailed["source"], "position")
+        self.assertAlmostEqual(detailed["vmaxKnots"], 10.0, delta=2.0)
+
+    # --- NIVEAU 2 : filtre d'accélération ------------------------------------
+    def test_saut_gps_isole_accel(self):
+        # Saut GPS isolé : 1 point décalé de ~20 m en 1 s (~38 nds apparents)
+        # au milieu d'une trace stable à 10 nds. Le filtre d'accélération
+        # rejette l'aller ET le retour -> Vmax reste ~10 nds.
+        cos_lat = math.cos(47.6 * DEG_TO_RAD)
+        m_per_deg_lon = 111320.0 * cos_lat
+        track = make_linear_speed_track([(10 * KN, 30, 1.0)])
+        i_mid = len(track) // 2
+        track[i_mid] = {**track[i_mid], "lon": track[i_mid]["lon"] + 20.0 / m_per_deg_lon}
+        vmax = compute_vmax_knots(track)
+        self.assertGreater(vmax, 8)
+        self.assertLess(vmax, 14)  # saut éliminé (pas gonflé à ~38 nds)
+
     def test_pic_isole_elimine(self):
-        # 5 nœuds réguliers, 1 Hz, pendant 20 s.
+        # Pic instantané > 90 nds (point téléporté ~1 s en avant) : rejeté.
         track = make_linear_speed_track([(5 * KN, 20, 1.0)])
-        # Injecte un artefact : un point 0.05 s après l'index 5, déjà ~1 s en avant.
         spike = dict(track[5])
         spike["time"] = track[5]["time"] + 50  # +0.05 s
         spike["lon"] = track[6]["lon"]          # position d'1 s plus loin
         track.insert(6, spike)
         track.sort(key=lambda p: p["time"])
-        vmax = compute_vmax_knots(track)
-        # La vitesse instantanée du pic dépasse 90 nœuds ; la fenêtre 2 s la gomme.
-        self.assertLess(vmax, 8)
+        self.assertLess(compute_vmax_knots(track), 8)
 
     def test_pic_2s_conserve(self):
-        # 5 nœuds, puis rafale 20 nœuds tenue 3 s, puis 5 nœuds.
+        # Rafale RÉELLE de 20 nds tenue 3 s : doit être conservée (≠ artefact).
         track = make_linear_speed_track([(5 * KN, 10, 1.0), (20 * KN, 3, 0.5), (5 * KN, 10, 1.0)])
         vmax = compute_vmax_knots(track)
         self.assertGreater(vmax, 18)
         self.assertLess(vmax, 22)
 
     def test_saut_300m_rejete(self):
-        # Un point qui "téléporte" à 300 m (> 40 nds) puis revient :
-        # rejeté par le filtre outlier (300 m / 1 s ≈ 583 nds > 40 nds).
+        # Téléportation de ~300 m (~583 nds) : rejetée (accel + garde-fou).
         track = make_linear_speed_track([(5 * KN, 20, 1.0)])
         teleport = dict(track[10])
-        teleport["lon"] = track[10]["lon"] + 0.004  # ~300 m de côté en 1 s
+        teleport["lon"] = track[10]["lon"] + 0.004  # ~300 m de côté
         track.insert(11, teleport)
         track.sort(key=lambda p: p["time"])
-        vmax = compute_vmax_knots(track)
-        self.assertLess(vmax, 8)  # le saut est rejeté, on reste à ~5 nds
+        self.assertLess(compute_vmax_knots(track), 8)
 
-    def test_saut_20m_filtre_median(self):
-        # Un point décalé de ~20 m en 1 s (≈38 nds apparents) est
-        # lissé par le filtre médian. Résultat théorique : 1.5× la vraie vitesse
-        # (le point est replacé à la position du suivant, dilatant la fenêtre
-        # de 2 s d'une case). Avec 10 nds réels → ≤ 16 nds après filtre.
-        # C'est bien en dessous des 38 nds bruts, et sous le seuil 40 nds.
+    # --- NIVEAU 3 : Hampel + coupures de signal ------------------------------
+    def test_derive_multipoints_hampel(self):
+        # Dérive : 4 points consécutifs décalés de ~15 m. Le filtre
+        # d'accélération + Hampel empêchent toute Vmax gonflée.
+        track = make_linear_speed_track([(10 * KN, 40, 1.0)])
+        i0 = len(track) // 2
+        for d in range(4):
+            track[i0 + d] = {**track[i0 + d], "lat": track[i0 + d]["lat"] + 15.0 / 111320.0}
+        vmax = compute_vmax_knots(track)
+        self.assertGreater(vmax, 8)
+        self.assertLess(vmax, 16)
+
+    def test_coupure_signal(self):
+        # Coupure de 8 s puis point décalé de ~200 m (balise ressortie de l'eau).
+        # Le saut sur dt=9 s a une accélération faible (passe le filtre accel),
+        # mais rejectSignalGaps invalide la vitesse parasite.
         cos_lat = math.cos(47.6 * DEG_TO_RAD)
         m_per_deg_lon = 111320.0 * cos_lat
         track = make_linear_speed_track([(10 * KN, 30, 1.0)])
-        i_mid = len(track) // 2
-        track[i_mid] = {
-            **track[i_mid],
-            "lon": track[i_mid]["lon"] + 20.0 / m_per_deg_lon,
-        }
+        i = len(track) // 2
+        for k in range(i, len(track)):
+            track[k] = dict(track[k], time=track[k]["time"] + 8000)  # trou de 8 s
+        track[i] = dict(track[i], lon=track[i]["lon"] + 200.0 / m_per_deg_lon)
         vmax = compute_vmax_knots(track)
-        self.assertLess(vmax, 18)   # bien < 38 nds bruts
-        self.assertGreater(vmax, 8)  # pas effacé complètement
+        self.assertGreater(vmax, 8)
+        self.assertLess(vmax, 14)  # parasite (~44 nds) invalidé
 
-    def test_plafond_40_noeuds(self):
-        # Une trace entièrement au-dessus de 40 nds est rejetée par le seuil.
-        track = make_linear_speed_track([(50 * KN, 10, 1.0)])
-        self.assertEqual(compute_vmax_knots(track), 0.0)
+    # --- Garde-fou & cohérence -----------------------------------------------
+    def test_garde_fou_physique(self):
+        # Plus de plafond "loisir" à 40 nds : 35 nds soutenus sont CONSERVÉS...
+        fast = make_linear_speed_track([(35 * KN, 20, 1.0)])
+        self.assertGreater(compute_vmax_knots(fast), 30)
+        # ...mais le garde-fou physique absolu (50 nds) rejette l'impossible (60 nds).
+        impossible = make_linear_speed_track([(60 * KN, 20, 1.0)])
+        self.assertEqual(compute_vmax_knots(impossible), 0.0)
 
-    def test_blip_1s_attenue(self):
-        # Un pic de 40 nœuds tenu 1 s est un déplacement réel, mais la fenêtre
-        # glissante de 2 s l'atténue nettement sous sa valeur instantanée (40 nds).
+    def test_blip_1s_supprime(self):
+        # Pic isolé de 40 nds tenu 1 s (5->40->5 ≈ 36 m/s², impossible) :
+        # le filtre d'accélération l'élimine (avant : seulement "atténué").
         track = make_linear_speed_track([(5 * KN, 8, 1.0), (40 * KN, 1, 1.0), (5 * KN, 8, 1.0)])
-        vmax = compute_vmax_knots(track)
-        self.assertLess(vmax, 30)   # atténué : bien en dessous des 40 nds instantanés
-        self.assertGreater(vmax, 15)  # mais pas totalement effacé (mouvement réel)
+        self.assertLess(compute_vmax_knots(track), 10)
+
+    def test_vmax_suspecte_flag(self):
+        # Sanity check : Vmax très au-dessus de la vmoy -> drapeau suspect.
+        self.assertTrue(is_vmax_suspect(40.0, 10.0))
+        self.assertFalse(is_vmax_suspect(22.0, 14.0))
 
 
 class TestWaypoints(unittest.TestCase):
