@@ -7,8 +7,10 @@ import {
   computeVmaxKnots,
   computeVmaxDetailed,
   isVmaxSuspect,
+  detectByOuterLoop,
 } from './tourDetector.js';
 import { ILE_AUX_MOINES_CENTROID as CENTER } from './constants.js';
+import { haversineMeters } from './geo.js';
 
 const DEG_TO_RAD = Math.PI / 180;
 
@@ -252,5 +254,130 @@ describe('tourDetector — Vmax (cascade)', () => {
   it('sanity check : signale une Vmax suspecte vs la vmoy', () => {
     expect(isVmaxSuspect(40, 10)).toBe(true);
     expect(isVmaxSuspect(22, 14)).toBe(false);
+  });
+});
+
+// ============================================================================
+// Tour par l'extérieur (Tour du Golfe) — detectByOuterLoop.
+// ============================================================================
+
+/** Parcours hexagonal synthétique : 6 balises = sommets de P (sens horaire). */
+function makeHexCourse() {
+  const center = { lat: 47.6, lon: -2.85 };
+  const R = 0.02; // ~2,2 km de rayon
+  const cosLat = Math.cos(center.lat * DEG_TO_RAD);
+  const verts = [];
+  for (let k = 0; k < 6; k++) {
+    const ang = (90 - k * 60) * DEG_TO_RAD; // sommets listés en sens horaire
+    verts.push({
+      lat: center.lat + R * Math.sin(ang),
+      lon: center.lon + (R * Math.cos(ang)) / cosLat,
+    });
+  }
+  return {
+    center,
+    cosLat,
+    validationType: 'outer-loop',
+    centroid: center,
+    boundingBox: { minLat: 47.4, maxLat: 47.8, minLon: -3.1, maxLon: -2.6 },
+    waypoints: verts.map((v, i) => ({
+      id: `b${i + 1}`,
+      name: `b${i + 1}`,
+      lat: v.lat,
+      lon: v.lon,
+      radiusMeters: 200,
+    })),
+    sectors: [
+      { id: 's1', name: 'Nord', startWaypointIndex: 0, endWaypointIndex: 1 },
+      { id: 's2', name: 'Est', startWaypointIndex: 1, endWaypointIndex: 3 },
+      { id: 's3', name: 'Sud', startWaypointIndex: 3, endWaypointIndex: 5 },
+      { id: 's4', name: 'Ouest', startWaypointIndex: 5, endWaypointIndex: 0 },
+    ],
+  };
+}
+
+/** Pousse un sommet radialement vers l'EXTÉRIEUR depuis le centre (offset en °). */
+function pushOut(center, cosLat, v, offsetDeg) {
+  const dy = v.lat - center.lat;
+  const dx = (v.lon - center.lon) * cosLat;
+  const len = Math.hypot(dx, dy) || 1;
+  return {
+    lat: v.lat + (dy / len) * offsetDeg,
+    lon: v.lon + ((dx / len) * offsetDeg) / cosLat,
+  };
+}
+
+/** Échantillonne une trace le long des 'anchors' à vitesse ~constante. */
+function samplePath(anchors, { speedMps = 3, sampleS = 3, startMs = Date.UTC(2024, 5, 1, 10, 0, 0) } = {}) {
+  const pts = [{ lat: anchors[0].lat, lon: anchors[0].lon, time: startMs }];
+  let t = startMs;
+  for (let s = 0; s + 1 < anchors.length; s++) {
+    const a = anchors[s];
+    const b = anchors[s + 1];
+    const steps = Math.max(1, Math.round(haversineMeters(a, b) / (speedMps * sampleS)));
+    for (let i = 1; i <= steps; i++) {
+      const f = i / steps;
+      t += sampleS * 1000;
+      pts.push({ lat: a.lat + (b.lat - a.lat) * f, lon: a.lon + (b.lon - a.lon) * f, time: t });
+    }
+  }
+  return pts;
+}
+
+/**
+ * Trace longeant les balises de l'ordre 'order' (indices), par l'extérieur
+ * (approches ~110 m DEHORS de P). cutThroughLegAt = index du leg où passer par
+ * le centre (= couper à travers P) ; -1 = aucune coupe.
+ */
+function makeOuterTrack(course, order, { cutThroughLegAt = -1 } = {}) {
+  const { center, cosLat, waypoints } = course;
+  const stops = order.map((i) => pushOut(center, cosLat, waypoints[i], 0.001));
+  const anchors = [];
+  for (let s = 0; s < stops.length; s++) {
+    anchors.push(stops[s]);
+    if (s === cutThroughLegAt && s + 1 < stops.length) anchors.push(center);
+  }
+  return samplePath(anchors);
+}
+
+describe('tourDetector — tour par l’extérieur (Tour du Golfe)', () => {
+  const course = makeHexCourse();
+
+  it('valide un tour extérieur complet dans le sens 1→6 (cw)', () => {
+    const res = detectByOuterLoop(makeOuterTrack(course, [0, 1, 2, 3, 4, 5]), course);
+    expect(res.valid).toBe(true);
+    expect(res.bestTour.direction).toBe('cw');
+    expect(res.bestTour.durationSeconds).toBeGreaterThan(180);
+    expect(res.bestTour.points.length).toBeGreaterThan(50);
+  });
+
+  it('valide le même tour dans le sens 6→1 (ccw)', () => {
+    const res = detectByOuterLoop(makeOuterTrack(course, [5, 4, 3, 2, 1, 0]), course);
+    expect(res.valid).toBe(true);
+    expect(res.bestTour.direction).toBe('ccw');
+  });
+
+  it('valide un départ depuis une balise du milieu (ordre cyclique)', () => {
+    const res = detectByOuterLoop(makeOuterTrack(course, [2, 3, 4, 5, 0, 1]), course);
+    expect(res.valid).toBe(true);
+    expect(res.bestTour.direction).toBe('cw');
+  });
+
+  it('rejette une trace qui coupe à travers le polygone', () => {
+    const res = detectByOuterLoop(
+      makeOuterTrack(course, [0, 1, 2, 3, 4, 5], { cutThroughLegAt: 1 }),
+      course,
+    );
+    expect(res.valid).toBe(false);
+  });
+
+  it('rejette si une balise n’est jamais approchée', () => {
+    const res = detectByOuterLoop(makeOuterTrack(course, [0, 1, 2, 3, 4]), course);
+    expect(res.valid).toBe(false);
+  });
+
+  it('rejette des balises approchées dans le désordre', () => {
+    const res = detectByOuterLoop(makeOuterTrack(course, [0, 2, 1, 3, 4, 5]), course);
+    expect(res.valid).toBe(false);
   });
 });

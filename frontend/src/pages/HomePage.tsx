@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { getLeaderboard, getLeaderboardTraces } from '../lib/api';
+import { traceToPositions, downsampleUniform } from '../lib/trace';
 import type { LeaderboardEntry, TraceRecord } from '../types';
 import { categoryColor } from '../lib/categories';
 import { formatDuration } from '../lib/format';
@@ -31,6 +32,14 @@ export default function HomePage() {
     ])
       .then(([board, tr]) => {
         if (cancelled) return;
+        // Diagnostic (ÉTAPE 2.1) : nombre de points reçus par l'accueil par trace.
+        if (import.meta.env.DEV) {
+          tr.forEach((t) =>
+            console.debug(
+              `[accueil] trace ${t.performance_id}: ${(t.gpx_tour_points || []).length} pts (gpx_tour_points)`,
+            ),
+          );
+        }
         setEntries(board.entries);
         setTraces(tr);
       })
@@ -47,9 +56,10 @@ export default function HomePage() {
       traces
         .map((t) => ({
           id: t.performance_id,
-          positions: (t.gpx_tour_points || []).map(
-            (p) => [p.lat, p.lon] as [number, number],
-          ),
+          // Trace COMPLÈTE (même source que la page détail), décimée UNIFORMÉMENT
+          // si besoin pour alléger la carte — jamais tronquée. Cap large (no-op
+          // tant que le stockage borne déjà à ~500 pts via downsampleTrace).
+          positions: downsampleUniform(traceToPositions(t.gpx_tour_points), 1000),
           color: categoryColor(t.category),
           label: `${t.username} · ${formatDuration(t.duration_seconds)}`,
         }))
@@ -69,7 +79,8 @@ export default function HomePage() {
     [course],
   );
 
-  const isWaypointCourse = course.validationType === 'waypoints';
+  // Parcours à balises (waypoints / outer-loop) : on affiche les cercles d'approche.
+  const hasMarkers = course.validationType !== 'winding';
 
   return (
     <div className="space-y-12">
@@ -130,13 +141,13 @@ export default function HomePage() {
               center={[course.centroid.lat, course.centroid.lon]}
               centerLabel={course.name}
               waypoints={mapWaypoints}
-              showWaypointRadius={isWaypointCourse}
+              showWaypointRadius={hasMarkers}
             />
             <div className="flex flex-wrap items-center justify-between gap-2">
-              {isWaypointCourse && (
+              {hasMarkers && (
                 <p className="text-sm text-slate-500">
-                  Les cercles bleus marquent les {course.waypoints.length} points de
-                  passage et leur rayon de validation ({course.waypoints[0]?.radiusMeters} m).
+                  Les cercles bleus marquent les {course.waypoints.length} balises et
+                  leur rayon d'approche ({course.waypoints[0]?.radiusMeters} m).
                 </p>
               )}
               {traces[0] && (

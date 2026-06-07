@@ -138,7 +138,7 @@ export default function SubmitPage() {
           center={[course.centroid.lat, course.centroid.lon]}
           centerLabel={course.name}
           waypoints={courseWaypoints}
-          showWaypointRadius={course.validationType === 'waypoints'}
+          showWaypointRadius={course.validationType !== 'winding'}
         />
       </div>
 
@@ -320,7 +320,7 @@ export default function SubmitPage() {
                 center={[course.centroid.lat, course.centroid.lon]}
                 centerLabel={course.name}
                 waypoints={courseWaypoints}
-                showWaypointRadius={course.validationType === 'waypoints'}
+                showWaypointRadius={course.validationType !== 'winding'}
               />
               <p className="text-xs text-slate-500">
                 Couleur relative au record du secteur : vert = rapide, rouge = lent.

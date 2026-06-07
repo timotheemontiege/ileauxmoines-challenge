@@ -86,6 +86,59 @@ def haversine_meters(a, b):
     return 2 * EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(h)))
 
 
+# ── Géométrie polygonale (miroir geo.js) — « tour par l'extérieur » ──────────
+METERS_PER_DEG = DEG_TO_RAD * EARTH_RADIUS_M  # ≈ 111195 m
+OUTER_LOOP_INCURSION_DEPTH_METERS = 250  # profondeur d'incursion tolérée (permissif)
+
+
+def point_in_polygon(point, polygon):
+    """Ray casting ; polygon = [{lat, lon}] non fermé. True si STRICTEMENT dedans."""
+    x, y = point["lon"], point["lat"]
+    inside = False
+    j = len(polygon) - 1
+    for i in range(len(polygon)):
+        xi, yi = polygon[i]["lon"], polygon[i]["lat"]
+        xj, yj = polygon[j]["lon"], polygon[j]["lat"]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def polygon_is_clockwise(polygon):
+    twice_area = 0.0
+    n = len(polygon)
+    for i in range(n):
+        a = polygon[i]
+        b = polygon[(i + 1) % n]
+        twice_area += a["lon"] * b["lat"] - b["lon"] * a["lat"]
+    return twice_area < 0
+
+
+def point_to_segment_meters(p, a, b):
+    cos0 = math.cos(p["lat"] * DEG_TO_RAD)
+    ax = (a["lon"] - p["lon"]) * cos0 * METERS_PER_DEG
+    ay = (a["lat"] - p["lat"]) * METERS_PER_DEG
+    bx = (b["lon"] - p["lon"]) * cos0 * METERS_PER_DEG
+    by = (b["lat"] - p["lat"]) * METERS_PER_DEG
+    dx, dy = bx - ax, by - ay
+    len2 = dx * dx + dy * dy
+    t = (-(ax * dx + ay * dy) / len2) if len2 > 0 else 0.0
+    t = max(0.0, min(1.0, t))
+    return math.hypot(ax + t * dx, ay + t * dy)
+
+
+def distance_to_polygon_boundary_meters(point, polygon):
+    best = float("inf")
+    j = len(polygon) - 1
+    for i in range(len(polygon)):
+        d = point_to_segment_meters(point, polygon[j], polygon[i])
+        if d < best:
+            best = d
+        j = i
+    return best
+
+
 # ============================================================================
 # Détection par indice d'enroulement (miroir tourDetector.js)
 # ============================================================================
@@ -451,7 +504,180 @@ def detect_by_waypoints(points, course, opts=None):
     return {"valid": True, "bestTour": best, "allTours": [best]}
 
 
+# ============================================================================
+# Détection « tour par l'extérieur » (miroir tourDetector.js)
+# ============================================================================
+def build_balise_visits(pts, balises, polygon):
+    raw = []
+    cur = None
+    for i, p in enumerate(pts):
+        b_idx, b_d = -1, float("inf")
+        for b, bal in enumerate(balises):
+            d = haversine_meters(p, bal)
+            if d <= bal["radiusMeters"] and d < b_d:
+                b_d, b_idx = d, b
+        if b_idx == -1:
+            if cur:
+                raw.append(cur)
+                cur = None
+            continue
+        if cur and cur["balise"] == b_idx:
+            if b_d < cur["bestD"]:
+                cur["bestD"], cur["bestI"] = b_d, i
+        else:
+            if cur:
+                raw.append(cur)
+            cur = {"balise": b_idx, "bestI": i, "bestD": b_d}
+    if cur:
+        raw.append(cur)
+
+    # Fusionne les visites consécutives de même balise (dip GPS toléré).
+    merged = []
+    for v in raw:
+        if merged and merged[-1]["balise"] == v["balise"]:
+            if v["bestD"] < merged[-1]["bestD"]:
+                merged[-1]["bestD"], merged[-1]["bestI"] = v["bestD"], v["bestI"]
+        else:
+            merged.append(dict(v))
+
+    out = []
+    for v in merged:
+        p = pts[v["bestI"]]
+        out.append({
+            "balise": v["balise"], "index": v["bestI"], "time": p["time"],
+            "distance": v["bestD"], "outside": not point_in_polygon(p, polygon),
+        })
+    return out
+
+
+def cyclic_direction(seq, n, clockwise_polygon):
+    if len(seq) != n or len(set(seq)) != n:
+        return None
+    step = ((seq[1] - seq[0]) % n + n) % n
+    if step != 1 and step != n - 1:
+        return None
+    for k in range(1, n):
+        if ((seq[k] - seq[k - 1]) % n + n) % n != step:
+            return None
+    if step == 1:
+        return "cw" if clockwise_polygon else "ccw"
+    return "ccw" if clockwise_polygon else "cw"
+
+
+def edge_between(a, b, n):
+    if (a + 1) % n == b:
+        return a
+    if (b + 1) % n == a:
+        return b
+    return -1
+
+
+def has_deep_incursion(pts, window, polygon, balises, depth):
+    for k in range(len(window) - 1):
+        for i in range(window[k]["index"] + 1, window[k + 1]["index"]):
+            p = pts[i]
+            if not point_in_polygon(p, polygon):
+                continue
+            if any(haversine_meters(p, b) <= b["radiusMeters"] for b in balises):
+                continue
+            if distance_to_polygon_boundary_meters(p, polygon) > depth:
+                return True
+    return False
+
+
+def build_outer_loop_sectors(course, window, n):
+    edge_info = {}
+    for k in range(len(window) - 1):
+        e = edge_between(window[k]["balise"], window[k + 1]["balise"], n)
+        if e < 0:
+            continue
+        t0 = min(window[k]["time"], window[k + 1]["time"])
+        t1 = max(window[k]["time"], window[k + 1]["time"])
+        edge_info[e] = {"dur": t1 - t0, "t0": t0, "t1": t1}
+    out = []
+    for s in course["sectors"]:
+        count = ((s["endWaypointIndex"] - s["startWaypointIndex"]) % n + n) % n
+        edges = [(s["startWaypointIndex"] + e) % n for e in range(count)]
+        if count == 0 or not all(e in edge_info for e in edges):
+            out.append(empty_sector(s))
+            continue
+        total = sum(edge_info[e]["dur"] for e in edges)
+        lo = min(edge_info[e]["t0"] for e in edges)
+        hi = max(edge_info[e]["t1"] for e in edges)
+        out.append({
+            "sectorId": s["id"], "name": s.get("name"),
+            "durationSeconds": round(total / 1000.0), "startTime": lo, "endTime": hi,
+        })
+    return out
+
+
+def detect_by_outer_loop(points, course, opts=None):
+    o = dict(DEFAULT_OPTS)
+    if opts:
+        o.update(opts)
+    pts = [p for p in filter_to_zone(points, o["bbox"]) if p.get("time") is not None]
+    pts.sort(key=lambda p: p["time"])
+    if len(pts) < 2:
+        return {"valid": False, "bestTour": None, "allTours": []}
+
+    balises = course["waypoints"]
+    n = len(balises)
+    if n < 3:
+        return {"valid": False, "bestTour": None, "allTours": []}
+
+    polygon = [{"lat": b["lat"], "lon": b["lon"]} for b in balises]
+    clockwise = polygon_is_clockwise(polygon)
+    depth = o.get("incursionDepthMeters", OUTER_LOOP_INCURSION_DEPTH_METERS)
+
+    visits = build_balise_visits(pts, balises, polygon)
+    if len(visits) < n:
+        return {"valid": False, "bestTour": None, "allTours": []}
+
+    best = None
+    for s in range(0, len(visits) - n + 1):
+        window = visits[s:s + n]
+        direction = cyclic_direction([v["balise"] for v in window], n, clockwise)  # (B)
+        if not direction:
+            continue
+        if not all(v["outside"] for v in window):  # (C)
+            continue
+        if has_deep_incursion(pts, window, polygon, balises, depth):  # (D)
+            continue
+        start_index = window[0]["index"]
+        end_index = window[n - 1]["index"]
+        if end_index <= start_index:
+            continue
+        duration = (pts[end_index]["time"] - pts[start_index]["time"]) / 1000.0
+        dist_m = sum(haversine_meters(pts[i - 1], pts[i]) for i in range(start_index + 1, end_index + 1))
+        avg = (dist_m / duration) * MS_TO_KNOTS if duration > 0 else 0.0
+        metrics = {"durationSeconds": duration, "distanceKm": dist_m / 1000.0, "avgSpeedKnots": avg}
+        if not is_valid_tour(metrics, o):  # (A) implicite : n visites cycliques trouvées
+            continue
+        if best is None or metrics["durationSeconds"] < best["durationSeconds"]:
+            best = dict(metrics, startIndex=start_index, endIndex=end_index,
+                        window=window, direction=direction)
+
+    if not best:
+        return {"valid": False, "bestTour": None, "allTours": []}
+
+    vm = compute_vmax_detailed(pts, best["startIndex"], best["endIndex"])
+    best_tour = {
+        "startIndex": best["startIndex"], "endIndex": best["endIndex"],
+        "startTime": pts[best["startIndex"]]["time"], "endTime": pts[best["endIndex"]]["time"],
+        "durationSeconds": best["durationSeconds"], "distanceKm": best["distanceKm"],
+        "avgSpeedKnots": best["avgSpeedKnots"], "vmaxKnots": vm["vmaxKnots"],
+        "vmaxSource": vm["source"], "vmaxSuspect": is_vmax_suspect(vm["vmaxKnots"], best["avgSpeedKnots"]),
+        "direction": best["direction"],
+        "sectors": build_outer_loop_sectors(course, best["window"], n),
+        "points": [{"lat": p["lat"], "lon": p["lon"], "time": p["time"]}
+                   for p in pts[best["startIndex"]:best["endIndex"] + 1]],
+    }
+    return {"valid": True, "bestTour": best_tour, "allTours": [best_tour]}
+
+
 def detect_tour(points, course):
+    if course["validationType"] == "outer-loop":
+        return detect_by_outer_loop(points, course)
     if course["validationType"] == "waypoints":
         return detect_by_waypoints(points, course)
     best = detect_best_tour(points, {"center": course["centroid"], "bbox": course["boundingBox"]})
@@ -544,6 +770,72 @@ def with_doppler(track, speed_mps):
 
 
 KN = 1.0 / MS_TO_KNOTS  # 1 nœud en m/s
+
+
+def make_hex_course():
+    """Parcours hexagonal synthétique : 6 balises = sommets de P (sens horaire)."""
+    center = {"lat": 47.6, "lon": -2.85}
+    R = 0.02  # ~2,2 km de rayon
+    cos_lat = math.cos(center["lat"] * DEG_TO_RAD)
+    verts = []
+    for k in range(6):
+        ang = (90 - k * 60) * DEG_TO_RAD  # sommets listés en sens horaire
+        verts.append({
+            "lat": center["lat"] + R * math.sin(ang),
+            "lon": center["lon"] + (R * math.cos(ang)) / cos_lat,
+        })
+    return {
+        "center": center, "cosLat": cos_lat,
+        "validationType": "outer-loop", "centroid": center,
+        "boundingBox": {"minLat": 47.4, "maxLat": 47.8, "minLon": -3.1, "maxLon": -2.6},
+        "waypoints": [
+            {"id": f"b{i + 1}", "name": f"b{i + 1}", "lat": v["lat"], "lon": v["lon"], "radiusMeters": 200}
+            for i, v in enumerate(verts)
+        ],
+        "sectors": [
+            {"id": "s1", "name": "Nord", "startWaypointIndex": 0, "endWaypointIndex": 1},
+            {"id": "s2", "name": "Est", "startWaypointIndex": 1, "endWaypointIndex": 3},
+            {"id": "s3", "name": "Sud", "startWaypointIndex": 3, "endWaypointIndex": 5},
+            {"id": "s4", "name": "Ouest", "startWaypointIndex": 5, "endWaypointIndex": 0},
+        ],
+    }
+
+
+def push_out(center, cos_lat, v, offset_deg):
+    """Pousse un sommet radialement vers l'EXTÉRIEUR depuis le centre."""
+    dy = v["lat"] - center["lat"]
+    dx = (v["lon"] - center["lon"]) * cos_lat
+    length = math.hypot(dx, dy) or 1.0
+    return {
+        "lat": v["lat"] + (dy / length) * offset_deg,
+        "lon": v["lon"] + ((dx / length) * offset_deg) / cos_lat,
+    }
+
+
+def sample_path(anchors, speed_mps=3.0, sample_s=3.0, start_ms=1_700_000_000_000):
+    pts = [{"lat": anchors[0]["lat"], "lon": anchors[0]["lon"], "time": start_ms}]
+    t = start_ms
+    for s in range(len(anchors) - 1):
+        a, b = anchors[s], anchors[s + 1]
+        steps = max(1, round(haversine_meters(a, b) / (speed_mps * sample_s)))
+        for i in range(1, steps + 1):
+            f = i / steps
+            t += int(sample_s * 1000)
+            pts.append({"lat": a["lat"] + (b["lat"] - a["lat"]) * f,
+                        "lon": a["lon"] + (b["lon"] - a["lon"]) * f, "time": t})
+    return pts
+
+
+def make_outer_track(course, order, cut_through_leg_at=-1):
+    """Longe les balises de 'order' par l'extérieur (approche ~110 m DEHORS de P)."""
+    center, cos_lat, wps = course["center"], course["cosLat"], course["waypoints"]
+    stops = [push_out(center, cos_lat, wps[i], 0.001) for i in order]
+    anchors = []
+    for s in range(len(stops)):
+        anchors.append(stops[s])
+        if s == cut_through_leg_at and s + 1 < len(stops):
+            anchors.append(center)  # coupe par le centre (incursion franche dans P)
+    return sample_path(anchors)
 
 
 # ============================================================================
@@ -749,6 +1041,42 @@ class TestSecteurs(unittest.TestCase):
         res = detect_by_waypoints(track, SQUARE_COURSE)
         self.assertFalse(res["valid"])
         self.assertIsNone(res["bestTour"])
+
+
+class TestOuterLoop(unittest.TestCase):
+    """Tour par l'extérieur (Tour du Golfe) — detect_by_outer_loop."""
+
+    def setUp(self):
+        self.course = make_hex_course()
+
+    def test_tour_complet_1_6_cw(self):
+        res = detect_by_outer_loop(make_outer_track(self.course, [0, 1, 2, 3, 4, 5]), self.course)
+        self.assertTrue(res["valid"])
+        self.assertEqual(res["bestTour"]["direction"], "cw")
+        self.assertGreater(res["bestTour"]["durationSeconds"], 180)
+
+    def test_tour_complet_6_1_ccw(self):
+        res = detect_by_outer_loop(make_outer_track(self.course, [5, 4, 3, 2, 1, 0]), self.course)
+        self.assertTrue(res["valid"])
+        self.assertEqual(res["bestTour"]["direction"], "ccw")
+
+    def test_depart_milieu_cyclique(self):
+        res = detect_by_outer_loop(make_outer_track(self.course, [2, 3, 4, 5, 0, 1]), self.course)
+        self.assertTrue(res["valid"])
+        self.assertEqual(res["bestTour"]["direction"], "cw")
+
+    def test_coupe_a_travers_rejete(self):
+        res = detect_by_outer_loop(
+            make_outer_track(self.course, [0, 1, 2, 3, 4, 5], cut_through_leg_at=1), self.course)
+        self.assertFalse(res["valid"])
+
+    def test_balise_manquee_rejete(self):
+        res = detect_by_outer_loop(make_outer_track(self.course, [0, 1, 2, 3, 4]), self.course)
+        self.assertFalse(res["valid"])
+
+    def test_desordre_rejete(self):
+        res = detect_by_outer_loop(make_outer_track(self.course, [0, 2, 1, 3, 4, 5]), self.course)
+        self.assertFalse(res["valid"])
 
 
 if __name__ == "__main__":

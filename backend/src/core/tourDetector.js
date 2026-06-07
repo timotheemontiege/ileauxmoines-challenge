@@ -5,8 +5,17 @@
 // d'angle (normalisées dans [-π, π]) atteint ±2π. On cherche la fenêtre temporelle
 // la plus courte qui réalise ce tour complet, sous contraintes de durée et de vitesse.
 
-import { DEFAULT_DETECTION_OPTIONS } from './constants.js';
-import { haversineMeters, MS_TO_KNOTS } from './geo.js';
+import {
+  DEFAULT_DETECTION_OPTIONS,
+  OUTER_LOOP_INCURSION_DEPTH_METERS,
+} from './constants.js';
+import {
+  haversineMeters,
+  MS_TO_KNOTS,
+  pointInPolygon,
+  polygonIsClockwise,
+  distanceToPolygonBoundaryMeters,
+} from './geo.js';
 
 const TWO_PI = 2 * Math.PI;
 const DEG_TO_RAD = Math.PI / 180;
@@ -511,6 +520,229 @@ export function detectByWaypoints(points, courseConfig, options = {}) {
   return { valid: true, bestTour, allTours: [bestTour] };
 }
 
+// ----------------------------------------------------------------------------
+// Validation « tour par l'extérieur » (Tour du Golfe).
+// Le rider longe les N balises (sommets du polygone P) dans l'ordre cyclique,
+// dans UN sens (cw|ccw), départ libre, en restant DEHORS de P et sans couper P.
+// ----------------------------------------------------------------------------
+
+/**
+ * Séquence des « visites » de balises le long de la trace. Une visite = un
+ * passage continu dans le rayon d'une balise ; on retient le point le plus
+ * proche (l'« approche ») et si ce point est à l'extérieur du polygone P.
+ * Les visites consécutives sur la MÊME balise sont fusionnées (dip GPS toléré).
+ */
+function buildBaliseVisits(pts, balises, polygon) {
+  const raw = [];
+  let cur = null; // { balise, bestI, bestD }
+  for (let i = 0; i < pts.length; i++) {
+    let bIdx = -1;
+    let bD = Infinity;
+    for (let b = 0; b < balises.length; b++) {
+      const d = haversineMeters(pts[i], balises[b]);
+      if (d <= balises[b].radiusMeters && d < bD) {
+        bD = d;
+        bIdx = b;
+      }
+    }
+    if (bIdx === -1) {
+      if (cur) { raw.push(cur); cur = null; }
+      continue;
+    }
+    if (cur && cur.balise === bIdx) {
+      if (bD < cur.bestD) { cur.bestD = bD; cur.bestI = i; }
+    } else {
+      if (cur) raw.push(cur);
+      cur = { balise: bIdx, bestI: i, bestD: bD };
+    }
+  }
+  if (cur) raw.push(cur);
+
+  // Fusionne les visites consécutives de même balise (sortie/retour bref du rayon).
+  const merged = [];
+  for (const v of raw) {
+    const last = merged[merged.length - 1];
+    if (last && last.balise === v.balise) {
+      if (v.bestD < last.bestD) { last.bestD = v.bestD; last.bestI = v.bestI; }
+    } else {
+      merged.push({ ...v });
+    }
+  }
+
+  return merged.map((v) => {
+    const p = pts[v.bestI];
+    return {
+      balise: v.balise,
+      index: v.bestI,
+      time: p.time,
+      distance: v.bestD,
+      outside: !pointInPolygon(p, polygon),
+    };
+  });
+}
+
+/**
+ * Si la suite d'indices de balises est un ordre cyclique cohérent (pas constant
+ * de +1 ou -1 modulo N, N balises distinctes), retourne le sens ; sinon null.
+ * Le sens (cw|ccw) tient compte de l'orientation réelle du polygone.
+ */
+function cyclicDirection(baliseSeq, N, clockwisePolygon) {
+  if (baliseSeq.length !== N) return null;
+  if (new Set(baliseSeq).size !== N) return null; // doit couvrir les N balises
+  const step = (((baliseSeq[1] - baliseSeq[0]) % N) + N) % N;
+  if (step !== 1 && step !== N - 1) return null;
+  for (let k = 1; k < N; k++) {
+    const d = (((baliseSeq[k] - baliseSeq[k - 1]) % N) + N) % N;
+    if (d !== step) return null;
+  }
+  // step=1 -> parcours dans l'ordre des sommets ; cw si le polygone est horaire.
+  if (step === 1) return clockwisePolygon ? 'cw' : 'ccw';
+  return clockwisePolygon ? 'ccw' : 'cw';
+}
+
+/** Indice de l'arête du polygone reliant 2 sommets cycliquement adjacents (sinon -1). */
+function edgeBetween(a, b, N) {
+  if ((a + 1) % N === b) return a;
+  if ((b + 1) % N === a) return b;
+  return -1;
+}
+
+/**
+ * (D) Vrai si, entre 2 approches consécutives de la fenêtre, la trace fait une
+ * incursion FRANCHE dans P : un point strictement dedans, à plus de `depth`
+ * mètres du bord, ET hors du rayon de toute balise (tolérance bruit/arrondi).
+ */
+function hasDeepIncursion(pts, window, polygon, balises, depth) {
+  for (let k = 0; k + 1 < window.length; k++) {
+    for (let i = window[k].index + 1; i < window[k + 1].index; i++) {
+      const p = pts[i];
+      if (!pointInPolygon(p, polygon)) continue;
+      let nearBalise = false;
+      for (const b of balises) {
+        if (haversineMeters(p, b) <= b.radiusMeters) { nearBalise = true; break; }
+      }
+      if (nearBalise) continue;
+      if (distanceToPolygonBoundaryMeters(p, polygon) > depth) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Découpe en façades (secteurs) à partir des temps de passage de la fenêtre.
+ * Une façade peut regrouper plusieurs arêtes (ex. 6 balises -> 4 façades) ;
+ * elle n'est mesurée que si TOUTES ses arêtes ont été parcourues dans la fenêtre
+ * (sinon emptySector — la fenêtre ouverte laisse une arête non parcourue).
+ */
+function buildOuterLoopSectors(courseConfig, window, N) {
+  const edgeInfo = new Map();
+  for (let k = 0; k + 1 < window.length; k++) {
+    const e = edgeBetween(window[k].balise, window[k + 1].balise, N);
+    if (e < 0) continue;
+    const t0 = Math.min(window[k].time, window[k + 1].time);
+    const t1 = Math.max(window[k].time, window[k + 1].time);
+    edgeInfo.set(e, { dur: t1 - t0, t0, t1 });
+  }
+  return (courseConfig.sectors || []).map((s) => {
+    const count = (((s.endWaypointIndex - s.startWaypointIndex) % N) + N) % N;
+    const edges = [];
+    for (let e = 0; e < count; e++) edges.push((s.startWaypointIndex + e) % N);
+    if (count === 0 || !edges.every((e) => edgeInfo.has(e))) return emptySector(s);
+    let total = 0;
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const e of edges) {
+      const info = edgeInfo.get(e);
+      total += info.dur;
+      lo = Math.min(lo, info.t0);
+      hi = Math.max(hi, info.t1);
+    }
+    return {
+      sectorId: s.id,
+      name: s.name,
+      durationSeconds: Math.round(total / 1000),
+      startTime: new Date(lo).toISOString(),
+      endTime: new Date(hi).toISOString(),
+    };
+  });
+}
+
+/**
+ * Détection « tour par l'extérieur » (Tour du Golfe).
+ * Valide si les N balises sont approchées (A) dans l'ordre cyclique d'un sens
+ * cohérent, départ libre (B), chaque approche DEHORS de P (C), sans incursion
+ * franche dans P entre 2 approches (D). Fenêtre = 1ʳᵉ → Nᵉ balise ; si plusieurs
+ * boucles valides, on garde la plus rapide.
+ */
+export function detectByOuterLoop(points, courseConfig, options = {}) {
+  const opts = { ...DEFAULT_DETECTION_OPTIONS, ...options };
+  const pts = filterToZone(points, opts.bbox)
+    .filter((p) => Number.isFinite(p.time))
+    .sort((a, b) => a.time - b.time);
+  if (pts.length < 2) return { valid: false, bestTour: null, allTours: [] };
+
+  const balises = courseConfig.waypoints || [];
+  const N = balises.length;
+  if (N < 3) return { valid: false, bestTour: null, allTours: [] };
+
+  const polygon = balises.map((b) => ({ lat: b.lat, lon: b.lon }));
+  const clockwise = polygonIsClockwise(polygon);
+  const depth = opts.incursionDepthMeters ?? OUTER_LOOP_INCURSION_DEPTH_METERS;
+
+  const visits = buildBaliseVisits(pts, balises, polygon);
+  if (visits.length < N) return { valid: false, bestTour: null, allTours: [] };
+
+  let best = null;
+  // Fenêtre glissante de N visites consécutives (départ libre).
+  for (let s = 0; s + N <= visits.length; s++) {
+    const window = visits.slice(s, s + N);
+    const direction = cyclicDirection(window.map((v) => v.balise), N, clockwise); // (B)
+    if (!direction) continue;
+    if (!window.every((v) => v.outside)) continue; // (C)
+    if (hasDeepIncursion(pts, window, polygon, balises, depth)) continue; // (D)
+
+    const startIndex = window[0].index;
+    const endIndex = window[N - 1].index;
+    if (endIndex <= startIndex) continue;
+
+    const durationSeconds = (pts[endIndex].time - pts[startIndex].time) / 1000;
+    let distanceM = 0;
+    for (let i = startIndex + 1; i <= endIndex; i++) {
+      distanceM += haversineMeters(pts[i - 1], pts[i]);
+    }
+    const avgSpeedKnots = durationSeconds > 0 ? (distanceM / durationSeconds) * MS_TO_KNOTS : 0;
+    const metrics = { durationSeconds, distanceKm: distanceM / 1000, avgSpeedKnots };
+    if (!isValidTour(metrics, opts)) continue; // (A) implicite : N visites cycliques trouvées
+
+    if (best === null || metrics.durationSeconds < best.durationSeconds) {
+      best = { ...metrics, startIndex, endIndex, window, direction };
+    }
+  }
+
+  if (!best) return { valid: false, bestTour: null, allTours: [] };
+
+  const vm = computeVmaxDetailed(pts, best.startIndex, best.endIndex); // pts portent speedRaw
+  const bestTour = {
+    startIndex: best.startIndex,
+    endIndex: best.endIndex,
+    startTime: pts[best.startIndex].time,
+    endTime: pts[best.endIndex].time,
+    durationSeconds: best.durationSeconds,
+    distanceKm: best.distanceKm,
+    avgSpeedKnots: best.avgSpeedKnots,
+    vmaxKnots: vm.vmaxKnots,
+    vmaxSource: vm.source, // 'doppler' | 'position' (diagnostic)
+    vmaxSuspect: isVmaxSuspect(vm.vmaxKnots, best.avgSpeedKnots),
+    direction: best.direction, // 'cw' | 'ccw' (info)
+    sectors: buildOuterLoopSectors(courseConfig, best.window, N),
+    points: pts
+      .slice(best.startIndex, best.endIndex + 1)
+      .map((p) => ({ lat: p.lat, lon: p.lon, time: p.time })),
+  };
+
+  return { valid: true, bestTour, allTours: [bestTour] };
+}
+
 /** Ajoute Vmax + découpage en secteurs à un tour « winding » déjà détecté. */
 function enrichWindingTour(tour, courseConfig) {
   const vm = computeVmaxDetailed(tour.points, 0, tour.points.length - 1);
@@ -552,6 +784,9 @@ export function detectTour(points, courseConfig) {
     center: courseConfig.centroid,
     bbox: courseConfig.boundingBox,
   };
+  if (courseConfig.validationType === 'outer-loop') {
+    return detectByOuterLoop(points, courseConfig, opts);
+  }
   if (courseConfig.validationType === 'waypoints') {
     return detectByWaypoints(points, courseConfig, opts);
   }
@@ -610,6 +845,7 @@ export default {
   detectTour,
   detectByWindingNumber,
   detectByWaypoints,
+  detectByOuterLoop,
   computeVmaxKnots,
   computeVmaxDetailed,
   buildSpeedSeries,

@@ -112,6 +112,16 @@ router.get('/leaderboard/traces', async (req, res, next) => {
     });
     if (error) throw new Error(error.message);
 
+    // Diagnostic (ÉTAPE 2.1) : nb de points renvoyés par le RPC, par trace.
+    // Activer avec DEBUG_TRACE_POINTS=1 pour comparer accueil vs détail.
+    if (process.env.DEBUG_TRACE_POINTS) {
+      for (const t of data || []) {
+        console.log(
+          `[leaderboard/traces] course=${courseId} perf=${t.performance_id} pts=${(t.gpx_tour_points || []).length}`,
+        );
+      }
+    }
+
     res.json({ traces: data || [], courseId });
   } catch (err) {
     next(err);
@@ -133,6 +143,13 @@ router.get('/performance/:id', async (req, res, next) => {
       .maybeSingle();
     if (error) throw new Error(error.message);
     if (!perf) return res.status(404).json({ error: 'Trace introuvable' });
+
+    // Diagnostic (ÉTAPE 2.1) : nb de points renvoyés par l'endpoint détail.
+    if (process.env.DEBUG_TRACE_POINTS) {
+      console.log(
+        `[performance/:id] perf=${perf.id} pts=${(perf.gpx_tour_points || []).length}`,
+      );
+    }
 
     const { data: profile, error: profileError } = await supabaseAdmin
       .from('profiles')
