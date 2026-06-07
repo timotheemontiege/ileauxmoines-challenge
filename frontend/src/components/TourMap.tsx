@@ -9,6 +9,7 @@ import {
   useMap,
 } from 'react-leaflet';
 import L from 'leaflet';
+import { splitAtGaps } from '../lib/trace';
 
 /** Centroïde de l'Île-aux-Moines (centre par défaut). */
 export const ISLAND_CENTER: [number, number] = [47.5975, -2.8433];
@@ -125,15 +126,19 @@ export default function TourMap({
             />
           ))}
 
-        {traces.map((trace) => (
-          <Polyline
-            key={trace.id}
-            positions={trace.positions}
-            pathOptions={{ color: trace.color, weight: 3, opacity: 0.85 }}
-          >
-            {trace.label && <Tooltip sticky>{trace.label}</Tooltip>}
-          </Polyline>
-        ))}
+        {traces.map((trace) =>
+          // Coupe la polyligne aux trous GPS : on ne relie pas les deux bords
+          // d'une coupure de signal par une droite (qui passerait sur la terre).
+          splitAtGaps(trace.positions).map((segment, i) => (
+            <Polyline
+              key={`${trace.id}#${i}`}
+              positions={segment}
+              pathOptions={{ color: trace.color, weight: 3, opacity: 0.85 }}
+            >
+              {trace.label && <Tooltip sticky>{trace.label}</Tooltip>}
+            </Polyline>
+          )),
+        )}
 
         <FitBounds traces={traces} waypoints={waypoints} fit={fit} />
       </MapContainer>
