@@ -42,34 +42,51 @@ export interface SectorSegment {
 }
 
 /**
- * Découpe la polyligne du tour en segments, un par secteur du parcours.
- * Pour chaque borne (waypoint), on prend le point du tour le plus proche, puis
- * on relie les bornes consécutives. L'arc le plus court est conservé (gère le
- * bouclage des parcours « winding »). Purement cosmétique (affichage carte).
+ * Découpe la polyligne du tour en segments colorés par secteur.
+ *
+ * On classe les bornes par leur ORDRE DE PASSAGE le long de la trace (indice du
+ * point le plus proche, trié), puis on découpe la boucle en arcs entre bornes
+ * consécutives. Ces arcs PARTITIONNENT toute la trace (aucun point perdu), même
+ * si le rider passe les pointes dans un ordre tourné/inversé — c'est la même
+ * logique que le backend `buildWindingSectors`. Chaque arc est colorié par la
+ * façade à laquelle appartient son arête (gère les façades multi-arêtes du Golfe).
+ * Purement cosmétique (affichage carte).
  */
 export function segmentTourBySectors(
   points: LatLonPoint[],
   course: Course,
 ): SectorSegment[] {
   if (points.length < 2 || course.waypoints.length === 0) return [];
-  const idx = course.waypoints.map((w) => nearestIndex(points, w));
-  const n = points.length;
+  const n = course.waypoints.length;
 
-  return course.sectors.map((s) => {
-    const a = idx[s.startWaypointIndex];
-    const b = idx[s.endWaypointIndex];
-    const lo = Math.min(a, b);
-    const hi = Math.max(a, b);
-    let slice: LatLonPoint[];
-    if (hi - lo <= n / 2) {
-      slice = points.slice(lo, hi + 1);
-    } else {
-      // arc de bouclage : on relie en passant par les extrémités de la trace
-      slice = [...points.slice(hi), ...points.slice(0, lo + 1)];
-    }
+  // Bornes triées par ordre de passage le long du tour.
+  const ordered = course.waypoints
+    .map((w, wpIndex) => ({ wpIndex, index: nearestIndex(points, w) }))
+    .sort((a, b) => a.index - b.index);
+
+  // Façade contenant l'arête entre deux bornes cycliquement adjacentes (wpA, wpB).
+  const sectorForEdge = (wpA: number, wpB: number) => {
+    const edge = (wpA + 1) % n === wpB ? wpA : (wpB + 1) % n === wpA ? wpB : -1;
+    if (edge < 0) return undefined; // bornes non adjacentes (ordre cassé)
+    return course.sectors.find((s) => {
+      const count = (((s.endWaypointIndex - s.startWaypointIndex) % n) + n) % n;
+      for (let k = 0; k < count; k++) {
+        if ((s.startWaypointIndex + k) % n === edge) return true;
+      }
+      return false;
+    });
+  };
+
+  return ordered.map((cur, k) => {
+    const nxt = ordered[(k + 1) % ordered.length];
+    const slice =
+      k + 1 < ordered.length
+        ? points.slice(cur.index, nxt.index + 1)
+        : [...points.slice(cur.index), ...points.slice(0, nxt.index + 1)]; // arc de bouclage
+    const sector = sectorForEdge(cur.wpIndex, nxt.wpIndex);
     return {
-      sectorId: s.id,
-      name: s.name,
+      sectorId: sector?.id ?? `arc${k}`,
+      name: sector?.name ?? '',
       positions: slice.map((p) => [p.lat, p.lon] as [number, number]),
     };
   });

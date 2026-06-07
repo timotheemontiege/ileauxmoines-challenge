@@ -100,12 +100,13 @@ export default function SubmitPage() {
     );
     return segmentTourBySectors(result.best.points, course)
       .filter((seg) => seg.positions.length > 1)
-      .map((seg) => {
+      .map((seg, i) => {
         const dur = durations.get(seg.sectorId);
         const color =
           dur != null ? sectorColor(dur, sectorRecords[seg.sectorId] ?? null) : '#64748b';
         return {
-          id: seg.sectorId,
+          // id unique : une façade multi-arêtes (Golfe) peut donner plusieurs arcs.
+          id: `${seg.sectorId}#${i}`,
           positions: seg.positions,
           color,
           label: dur != null ? `${seg.name} · ${formatDuration(dur)}` : seg.name,
