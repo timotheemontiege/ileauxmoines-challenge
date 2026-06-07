@@ -9,7 +9,9 @@
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "backfill:vmax": "node scripts/backfill-vmax.js",
+    "backfill:vmax:dry": "node scripts/backfill-vmax.js --dry-run"
   },
   "engines": {
     "node": ">=20.10"

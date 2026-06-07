@@ -21,6 +21,23 @@ export const GOLFE_BBOX = {
 /** Catégories de matériel autorisées pour une performance. */
 export const CATEGORIES = ['wingfoil', 'windsurf', 'kitesurf', 'voile_legere', 'autre'];
 
+// ── Validation « tour par l'extérieur » (Tour du Golfe) ─────────────────────
+// Le rider doit longer les 6 balises (sommets du polygone P) dans l'ordre
+// cyclique, dans un sens libre (cw|ccw), départ libre, en restant DEHORS de P
+// et sans couper à travers P.
+
+/** Rayon d'approche par défaut d'une balise (m) si non précisé par balise. */
+export const OUTER_LOOP_DEFAULT_RADIUS_METERS = 300;
+
+/**
+ * Profondeur (m) à l'intérieur du polygone P au-delà de laquelle un point — qui
+ * n'est PAS dans le rayon d'une balise — compte comme une vraie incursion
+ * (« la trace coupe à travers P ») et invalide le tour.
+ * 250 m = réglage PERMISSIF : tolère d'arrondir une balise un peu en dedans et
+ * le bruit GPS côtier ; ne rejette que les franches traversées du Golfe.
+ */
+export const OUTER_LOOP_INCURSION_DEPTH_METERS = 250;
+
 /** Paramètres par défaut de l'algorithme de détection de tour. */
 export const DEFAULT_DETECTION_OPTIONS = {
   center: ILE_AUX_MOINES_CENTROID,

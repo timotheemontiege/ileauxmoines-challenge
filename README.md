@@ -148,7 +148,7 @@ npm run dev                 # http://localhost:5173
 
 Fichier : [`backend/src/core/tourDetector.js`](backend/src/core/tourDetector.js).
 Point d'entrée : `detectTour(points, courseConfig)` → `{ valid, bestTour, allTours }`,
-qui route selon `courseConfig.validationType` (`winding` ou `waypoints`). La
+qui route selon `courseConfig.validationType` (`winding`, `waypoints` ou `outer-loop`). La
 config des parcours (coordonnées OSM des pointes / waypoints, secteurs) vit dans
 [`backend/src/config/courses.js`](backend/src/config/courses.js) (miroir frontend
 typé dans `frontend/src/config/courses.ts`).
@@ -159,7 +159,8 @@ Sur le meilleur tour, on calcule aussi :
   (`distance(Pᵢ, Pⱼ) / Δt`), ce qui élimine les artefacts GPS (Δt minuscule) tout
   en conservant une accélération réellement tenue ;
 - **Temps par secteur** : découpe du tour entre les **bornes de secteur** (pointes
-  pour le winding, waypoints consécutifs pour le Tour du Golfe).
+  pour le winding, **4 façades** regroupant les arêtes inter-balises pour le Tour
+  du Golfe).
 
 ### A. Winding number (Île-aux-Moines, Île d'Arz)
 
@@ -185,31 +186,39 @@ rotation **nette** (les allers-retours s'annulent).
 > Un avertissement est affiché si la **fréquence GPS** est trop basse
 > (> 2 s entre deux points ; 1 pt/s recommandé).
 
-### B. Waypoints ordonnés (Tour du Golfe)
+### B. Tour par l'extérieur (Tour du Golfe)
 
-Le tour est valide si **tous les waypoints** (8 points GPS du Golfe) sont
-**passés dans l'ordre** : un waypoint est « passé » si un point de la trace entre
-dans son rayon (`radiusMeters = 300`). Le chrono court du **premier passage du
-waypoint 0** au **dernier passage du waypoint final**. Repasser une borne déjà
-validée (demi-tour accidentel) **n'invalide pas** le tour. Les secteurs sont les
-**intervalles entre waypoints consécutifs**.
+Le tour est valide si les **6 balises** (sommets du polygone `P`) sont **longées
+par l'EXTÉRIEUR**, dans l'**ordre cyclique** et dans **un sens cohérent** (horaire
+ou anti-horaire), **départ libre** :
+
+1. chaque balise est **approchée** (point de la trace à `< radiusMeters = 300 m`) ;
+2. les approches s'enchaînent dans l'ordre cyclique d'**un seul sens** (1→6 *ou* 6→1) ;
+3. au plus proche de chaque balise, la trace est **à l'extérieur** de `P`
+   (test point-in-polygon) ;
+4. **sans couper** `P` : aucune incursion franche (`> 250 m` de profondeur, hors
+   rayon d'une balise) entre deux approches.
+
+Le chrono court du **premier passage** à la **sixième balise** ; la **boucle la
+plus rapide** est retenue ; un champ `direction` (`cw`/`ccw`) est renvoyé. Les
+**4 façades** (Nord/Est/Sud/Ouest) regroupent les 6 arêtes inter-balises (cf.
+`courses.js`).
 
 ### Tests
 
-**Node.js n'étant pas installé**, la logique JS est portée en **Python 3** et
-testée dans
+La logique JS (**source de vérité**, `npm test` / Vitest) est aussi **portée en
+Python 3** (port de référence) dans
 [`backend/tests/test_tour_detector.py`](backend/tests/test_tour_detector.py) :
 tour complet / sens horaire / **demi-tour rejeté** / **2 tours** / **trace bruitée**,
 waypoints **dans l'ordre / manquant / en désordre / demi-tour toléré**,
-**Vmax** (artefact éliminé, pic 2 s conservé, atténuation), **secteurs**
-(découpe correcte winding & waypoints, secteur absent si tour incomplet).
+**tour par l'extérieur** (sens 1→6 & 6→1, départ milieu ; coupe / balise manquée /
+désordre rejetés), **Vmax** (artefact éliminé, pic 2 s conservé, atténuation),
+**secteurs** (découpe correcte winding & waypoints, secteur absent si tour incomplet).
 
 ```bash
-python backend/tests/test_tour_detector.py     # 16 tests, stdlib uniquement
+npm --prefix backend test                       # 24 tests Vitest (source de vérité)
+python backend/tests/test_tour_detector.py      # 30 tests, stdlib uniquement
 ```
-
-> Le fichier vitest historique [`tourDetector.test.js`](backend/src/core/tourDetector.test.js)
-> reste présent pour `npm test` une fois Node installé.
 
 ---
 

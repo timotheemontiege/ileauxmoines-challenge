@@ -4,6 +4,7 @@ import { getPerformance, getSectorLeaderboard } from '../lib/api';
 import type { PerformanceDetailResponse } from '../types';
 import { getCourse } from '../config/courses';
 import { segmentTourBySectors, sectorColor } from '../lib/sectors';
+import { traceToPositions } from '../lib/trace';
 import {
   formatDate,
   formatDistance,
@@ -30,6 +31,12 @@ export default function TraceDetailPage() {
     getPerformance(id)
       .then((res) => {
         if (cancelled) return;
+        // Diagnostic (ÉTAPE 2.1) : nombre de points reçus par la page détail.
+        if (import.meta.env.DEV) {
+          console.debug(
+            `[détail] trace ${id}: ${res.performance.gpx_tour_points?.length ?? 0} pts (gpx_tour_points)`,
+          );
+        }
         setData(res);
       })
       .catch((err) => !cancelled && setError((err as Error).message))
@@ -124,9 +131,7 @@ export default function TraceDetailPage() {
       ? [
           {
             id: 'trace',
-            positions: (p.gpx_tour_points || []).map(
-              (pt) => [pt.lat, pt.lon] as [number, number],
-            ),
+            positions: traceToPositions(p.gpx_tour_points),
             color: '#38bdf8',
             label: `${p.username ?? 'Trace'} · ${formatDuration(p.duration_seconds)}`,
           },
@@ -185,7 +190,7 @@ export default function TraceDetailPage() {
           center={course ? [course.centroid.lat, course.centroid.lon] : undefined}
           centerLabel={data.courseName}
           waypoints={waypoints}
-          showWaypointRadius={course?.validationType === 'waypoints'}
+          showWaypointRadius={course != null && course.validationType !== 'winding'}
         />
         {sectorSegments.length > 0 && (
           <p className="text-xs text-slate-500">

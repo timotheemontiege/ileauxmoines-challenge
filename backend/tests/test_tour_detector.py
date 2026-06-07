@@ -86,6 +86,59 @@ def haversine_meters(a, b):
     return 2 * EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(h)))
 
 
+# ── Géométrie polygonale (miroir geo.js) — « tour par l'extérieur » ──────────
+METERS_PER_DEG = DEG_TO_RAD * EARTH_RADIUS_M  # ≈ 111195 m
+OUTER_LOOP_INCURSION_DEPTH_METERS = 250  # profondeur d'incursion tolérée (permissif)
+
+
+def point_in_polygon(point, polygon):
+    """Ray casting ; polygon = [{lat, lon}] non fermé. True si STRICTEMENT dedans."""
+    x, y = point["lon"], point["lat"]
+    inside = False
+    j = len(polygon) - 1
+    for i in range(len(polygon)):
+        xi, yi = polygon[i]["lon"], polygon[i]["lat"]
+        xj, yj = polygon[j]["lon"], polygon[j]["lat"]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def polygon_is_clockwise(polygon):
+    twice_area = 0.0
+    n = len(polygon)
+    for i in range(n):
+        a = polygon[i]
+        b = polygon[(i + 1) % n]
+        twice_area += a["lon"] * b["lat"] - b["lon"] * a["lat"]
+    return twice_area < 0
+
+
+def point_to_segment_meters(p, a, b):
+    cos0 = math.cos(p["lat"] * DEG_TO_RAD)
+    ax = (a["lon"] - p["lon"]) * cos0 * METERS_PER_DEG
+    ay = (a["lat"] - p["lat"]) * METERS_PER_DEG
+    bx = (b["lon"] - p["lon"]) * cos0 * METERS_PER_DEG
+    by = (b["lat"] - p["lat"]) * METERS_PER_DEG
+    dx, dy = bx - ax, by - ay
+    len2 = dx * dx + dy * dy
+    t = (-(ax * dx + ay * dy) / len2) if len2 > 0 else 0.0
+    t = max(0.0, min(1.0, t))
+    return math.hypot(ax + t * dx, ay + t * dy)
+
+
+def distance_to_polygon_boundary_meters(point, polygon):
+    best = float("inf")
+    j = len(polygon) - 1
+    for i in range(len(polygon)):
+        d = point_to_segment_meters(point, polygon[j], polygon[i])
+        if d < best:
+            best = d
+        j = i
+    return best
+
+
 # ============================================================================
 # Détection par indice d'enroulement (miroir tourDetector.js)
 # ============================================================================
@@ -150,7 +203,8 @@ def build_tour(ctx, i, j, m):
         "durationSeconds": m["durationSeconds"],
         "distanceKm": m["distanceKm"],
         "avgSpeedKnots": m["avgSpeedKnots"],
-        "points": [{"lat": p["lat"], "lon": p["lon"], "time": p["time"]} for p in pts],
+        # speedRaw conservé pour permettre la Vmax Doppler (retiré ensuite).
+        "points": [{"lat": p["lat"], "lon": p["lon"], "time": p["time"], "speedRaw": p.get("speedRaw")} for p in pts],
     }
 
 
@@ -195,49 +249,120 @@ def detect_all_tours(points, opts=None):
 
 
 # ============================================================================
-# Vmax (fenêtre glissante >= 2 s)
+# Vmax — cascade Doppler -> position -> nettoyage (miroir tourDetector.js)
 # ============================================================================
-def reject_gps_outliers(points, max_knots):
-    """Écarte les points dont la vitesse depuis le dernier point accepté
-    dépasse max_knots (saut/téléportation GPS physiquement impossible)."""
-    max_mps = max_knots / MS_TO_KNOTS
-    out = []
-    for p in points:
-        if p.get("time") is None:
+DOPPLER_MIN_COVERAGE = 0.8   # part de points avec vitesse mesurée -> NIVEAU 1
+ACCEL_MAX_MS2 = 6.0          # accélération max plausible (NIVEAU 2)
+HAMPEL_WINDOW = 7            # fenêtre du filtre de Hampel (NIVEAU 3)
+HAMPEL_NSIGMA = 3
+SIGNAL_GAP_SECONDS = 5       # dt au-delà = coupure de signal (NIVEAU 3)
+GAP_INVALIDATE_POINTS = 2
+VMAX_HARD_CEILING_KNOTS = 50  # garde-fou physique absolu (pas un cap loisir)
+VMAX_SANITY_MARGIN_KNOTS = 15
+MS_PER_KNOT = 1.0 / MS_TO_KNOTS
+NAN = float("nan")
+
+
+def _median(values):
+    s = sorted(values)
+    n = len(s)
+    if n == 0:
+        return NAN
+    m = n // 2
+    return s[m] if n % 2 else (s[m - 1] + s[m]) / 2.0
+
+
+def build_speed_series(points, accel_max=ACCEL_MAX_MS2, min_coverage=DOPPLER_MIN_COVERAGE):
+    """NIVEAUX 1 & 2 : série de vitesses (m/s), une par point (NaN = invalide)."""
+    n = len(points)
+    series = [NAN] * n
+    measured = sum(1 for p in points
+                   if p.get("speedRaw") is not None and math.isfinite(p["speedRaw"]))
+    # NIVEAU 1 — Doppler.
+    if n > 0 and measured / n >= min_coverage:
+        for i, p in enumerate(points):
+            sr = p.get("speedRaw")
+            if sr is not None and math.isfinite(sr):
+                series[i] = sr
+        return series, "doppler"
+    # NIVEAU 2 — position + filtre d'accélération.
+    prev_seg_v = NAN
+    for i in range(1, n):
+        dt = (points[i]["time"] - points[i - 1]["time"]) / 1000.0
+        if not (dt > 0):
+            prev_seg_v = NAN
             continue
-        if not out:
-            out.append(p)
+        v = haversine_meters(points[i - 1], points[i]) / dt
+        if math.isfinite(prev_seg_v) and abs(v - prev_seg_v) / dt > accel_max:
+            series[i] = NAN
+        else:
+            series[i] = v
+        prev_seg_v = v
+    if n > 1 and math.isfinite(series[1]):
+        series[0] = series[1]
+    return series, "position"
+
+
+def hampel_filter(series, window_size=HAMPEL_WINDOW, n_sigma=HAMPEL_NSIGMA):
+    """NIVEAU 3 — médiane glissante robuste ; comble aussi les trous (NaN)."""
+    n = len(series)
+    out = list(series)
+    k = max(1, window_size // 2)
+    for i in range(n):
+        win = [series[j] for j in range(max(0, i - k), min(n - 1, i + k) + 1)
+               if math.isfinite(series[j])]
+        if not win:
             continue
-        prev = out[-1]
-        dt = (p["time"] - prev["time"]) / 1000.0
-        if dt <= 0:
+        med = _median(win)
+        if not math.isfinite(series[i]):
+            out[i] = med
             continue
-        if haversine_meters(prev, p) / dt <= max_mps:
-            out.append(p)
+        mad = _median([abs(v - med) for v in win])
+        sigma = 1.4826 * mad
+        if sigma > 0 and abs(series[i] - med) > n_sigma * sigma:
+            out[i] = med
     return out
 
 
-def compute_vmax_knots(points, start_index=0, end_index=None,
-                       min_window=MIN_VMAX_WINDOW_SECONDS, max_knots=60):
+def reject_signal_gaps(points, series, gap_seconds=SIGNAL_GAP_SECONDS,
+                       invalidate=GAP_INVALIDATE_POINTS):
+    """NIVEAU 3 — invalide les vitesses des points suivant une coupure de signal."""
+    for i in range(1, len(points)):
+        dt = (points[i]["time"] - points[i - 1]["time"]) / 1000.0
+        if dt > gap_seconds:
+            for k in range(invalidate):
+                if i + k < len(series):
+                    series[i + k] = NAN
+    return series
+
+
+def compute_vmax_detailed(points, start_index=0, end_index=None):
     if end_index is None:
         end_index = len(points) - 1
-    clean = reject_gps_outliers(points[start_index:end_index + 1], max_knots)
-    if len(clean) < 2:
-        return 0.0
+    sl = points[start_index:end_index + 1]
+    if len(sl) < 2:
+        return {"vmaxKnots": 0.0, "source": "position", "cleanCount": 0}
+    series, source = build_speed_series(sl)
+    cleaned = hampel_filter(series)
+    reject_signal_gaps(sl, cleaned)
+    ceil = VMAX_HARD_CEILING_KNOTS * MS_PER_KNOT
     vmax = 0.0
-    j = 0
-    last = len(clean) - 1
-    for i in range(len(clean)):
-        if j < i:
-            j = i
-        while j < last and (clean[j]["time"] - clean[i]["time"]) / 1000.0 < min_window:
-            j += 1
-        dt = (clean[j]["time"] - clean[i]["time"]) / 1000.0
-        if dt >= min_window:
-            knots = (haversine_meters(clean[i], clean[j]) / dt) * MS_TO_KNOTS
-            if knots > vmax and knots <= max_knots:
-                vmax = knots
-    return vmax
+    clean_count = 0
+    for v in cleaned:
+        if math.isfinite(v) and v <= ceil:
+            clean_count += 1
+            if v > vmax:
+                vmax = v
+    return {"vmaxKnots": vmax * MS_TO_KNOTS, "source": source, "cleanCount": clean_count}
+
+
+def compute_vmax_knots(points, start_index=0, end_index=None):
+    return compute_vmax_detailed(points, start_index, end_index)["vmaxKnots"]
+
+
+def is_vmax_suspect(vmax_knots, avg_speed_knots, margin=VMAX_SANITY_MARGIN_KNOTS):
+    return (math.isfinite(vmax_knots) and math.isfinite(avg_speed_knots)
+            and vmax_knots > avg_speed_knots + margin)
 
 
 # ============================================================================
@@ -352,7 +477,7 @@ def detect_by_waypoints(points, course, opts=None):
     duration = (end_time - start_time) / 1000.0
     dist_m = sum(haversine_meters(pts[i - 1], pts[i]) for i in range(start_index + 1, end_index + 1))
     avg = (dist_m / duration) * MS_TO_KNOTS if duration > 0 else 0.0
-    vmax = compute_vmax_knots(pts, start_index, end_index)
+    vm = compute_vmax_detailed(pts, start_index, end_index)  # pts portent speedRaw
 
     sectors = []
     for s in course["sectors"]:
@@ -371,20 +496,200 @@ def detect_by_waypoints(points, course, opts=None):
         "startIndex": start_index, "endIndex": end_index,
         "startTime": start_time, "endTime": end_time,
         "durationSeconds": duration, "distanceKm": dist_m / 1000.0,
-        "avgSpeedKnots": avg, "vmaxKnots": vmax, "sectors": sectors,
+        "avgSpeedKnots": avg, "vmaxKnots": vm["vmaxKnots"],
+        "vmaxSource": vm["source"], "vmaxSuspect": is_vmax_suspect(vm["vmaxKnots"], avg),
+        "sectors": sectors,
         "points": [{"lat": p["lat"], "lon": p["lon"], "time": p["time"]} for p in pts[start_index:end_index + 1]],
     }
     return {"valid": True, "bestTour": best, "allTours": [best]}
 
 
+# ============================================================================
+# Détection « tour par l'extérieur » (miroir tourDetector.js)
+# ============================================================================
+def build_balise_visits(pts, balises, polygon):
+    raw = []
+    cur = None
+    for i, p in enumerate(pts):
+        b_idx, b_d = -1, float("inf")
+        for b, bal in enumerate(balises):
+            d = haversine_meters(p, bal)
+            if d <= bal["radiusMeters"] and d < b_d:
+                b_d, b_idx = d, b
+        if b_idx == -1:
+            if cur:
+                raw.append(cur)
+                cur = None
+            continue
+        if cur and cur["balise"] == b_idx:
+            if b_d < cur["bestD"]:
+                cur["bestD"], cur["bestI"] = b_d, i
+        else:
+            if cur:
+                raw.append(cur)
+            cur = {"balise": b_idx, "bestI": i, "bestD": b_d}
+    if cur:
+        raw.append(cur)
+
+    # Fusionne les visites consécutives de même balise (dip GPS toléré).
+    merged = []
+    for v in raw:
+        if merged and merged[-1]["balise"] == v["balise"]:
+            if v["bestD"] < merged[-1]["bestD"]:
+                merged[-1]["bestD"], merged[-1]["bestI"] = v["bestD"], v["bestI"]
+        else:
+            merged.append(dict(v))
+
+    out = []
+    for v in merged:
+        p = pts[v["bestI"]]
+        out.append({
+            "balise": v["balise"], "index": v["bestI"], "time": p["time"],
+            "distance": v["bestD"], "outside": not point_in_polygon(p, polygon),
+        })
+    return out
+
+
+def cyclic_direction(seq, n, clockwise_polygon):
+    if len(seq) != n or len(set(seq)) != n:
+        return None
+    step = ((seq[1] - seq[0]) % n + n) % n
+    if step != 1 and step != n - 1:
+        return None
+    for k in range(1, n):
+        if ((seq[k] - seq[k - 1]) % n + n) % n != step:
+            return None
+    if step == 1:
+        return "cw" if clockwise_polygon else "ccw"
+    return "ccw" if clockwise_polygon else "cw"
+
+
+def edge_between(a, b, n):
+    if (a + 1) % n == b:
+        return a
+    if (b + 1) % n == a:
+        return b
+    return -1
+
+
+def has_deep_incursion(pts, window, polygon, balises, depth):
+    for k in range(len(window) - 1):
+        for i in range(window[k]["index"] + 1, window[k + 1]["index"]):
+            p = pts[i]
+            if not point_in_polygon(p, polygon):
+                continue
+            if any(haversine_meters(p, b) <= b["radiusMeters"] for b in balises):
+                continue
+            if distance_to_polygon_boundary_meters(p, polygon) > depth:
+                return True
+    return False
+
+
+def build_outer_loop_sectors(course, window, n):
+    edge_info = {}
+    for k in range(len(window) - 1):
+        e = edge_between(window[k]["balise"], window[k + 1]["balise"], n)
+        if e < 0:
+            continue
+        t0 = min(window[k]["time"], window[k + 1]["time"])
+        t1 = max(window[k]["time"], window[k + 1]["time"])
+        edge_info[e] = {"dur": t1 - t0, "t0": t0, "t1": t1}
+    out = []
+    for s in course["sectors"]:
+        count = ((s["endWaypointIndex"] - s["startWaypointIndex"]) % n + n) % n
+        edges = [(s["startWaypointIndex"] + e) % n for e in range(count)]
+        if count == 0 or not all(e in edge_info for e in edges):
+            out.append(empty_sector(s))
+            continue
+        total = sum(edge_info[e]["dur"] for e in edges)
+        lo = min(edge_info[e]["t0"] for e in edges)
+        hi = max(edge_info[e]["t1"] for e in edges)
+        out.append({
+            "sectorId": s["id"], "name": s.get("name"),
+            "durationSeconds": round(total / 1000.0), "startTime": lo, "endTime": hi,
+        })
+    return out
+
+
+def detect_by_outer_loop(points, course, opts=None):
+    o = dict(DEFAULT_OPTS)
+    if opts:
+        o.update(opts)
+    pts = [p for p in filter_to_zone(points, o["bbox"]) if p.get("time") is not None]
+    pts.sort(key=lambda p: p["time"])
+    if len(pts) < 2:
+        return {"valid": False, "bestTour": None, "allTours": []}
+
+    balises = course["waypoints"]
+    n = len(balises)
+    if n < 3:
+        return {"valid": False, "bestTour": None, "allTours": []}
+
+    polygon = [{"lat": b["lat"], "lon": b["lon"]} for b in balises]
+    clockwise = polygon_is_clockwise(polygon)
+    depth = o.get("incursionDepthMeters", OUTER_LOOP_INCURSION_DEPTH_METERS)
+
+    visits = build_balise_visits(pts, balises, polygon)
+    if len(visits) < n:
+        return {"valid": False, "bestTour": None, "allTours": []}
+
+    best = None
+    for s in range(0, len(visits) - n + 1):
+        window = visits[s:s + n]
+        direction = cyclic_direction([v["balise"] for v in window], n, clockwise)  # (B)
+        if not direction:
+            continue
+        if not all(v["outside"] for v in window):  # (C)
+            continue
+        if has_deep_incursion(pts, window, polygon, balises, depth):  # (D)
+            continue
+        start_index = window[0]["index"]
+        end_index = window[n - 1]["index"]
+        if end_index <= start_index:
+            continue
+        duration = (pts[end_index]["time"] - pts[start_index]["time"]) / 1000.0
+        dist_m = sum(haversine_meters(pts[i - 1], pts[i]) for i in range(start_index + 1, end_index + 1))
+        avg = (dist_m / duration) * MS_TO_KNOTS if duration > 0 else 0.0
+        metrics = {"durationSeconds": duration, "distanceKm": dist_m / 1000.0, "avgSpeedKnots": avg}
+        if not is_valid_tour(metrics, o):  # (A) implicite : n visites cycliques trouvées
+            continue
+        if best is None or metrics["durationSeconds"] < best["durationSeconds"]:
+            best = dict(metrics, startIndex=start_index, endIndex=end_index,
+                        window=window, direction=direction)
+
+    if not best:
+        return {"valid": False, "bestTour": None, "allTours": []}
+
+    vm = compute_vmax_detailed(pts, best["startIndex"], best["endIndex"])
+    best_tour = {
+        "startIndex": best["startIndex"], "endIndex": best["endIndex"],
+        "startTime": pts[best["startIndex"]]["time"], "endTime": pts[best["endIndex"]]["time"],
+        "durationSeconds": best["durationSeconds"], "distanceKm": best["distanceKm"],
+        "avgSpeedKnots": best["avgSpeedKnots"], "vmaxKnots": vm["vmaxKnots"],
+        "vmaxSource": vm["source"], "vmaxSuspect": is_vmax_suspect(vm["vmaxKnots"], best["avgSpeedKnots"]),
+        "direction": best["direction"],
+        "sectors": build_outer_loop_sectors(course, best["window"], n),
+        "points": [{"lat": p["lat"], "lon": p["lon"], "time": p["time"]}
+                   for p in pts[best["startIndex"]:best["endIndex"] + 1]],
+    }
+    return {"valid": True, "bestTour": best_tour, "allTours": [best_tour]}
+
+
 def detect_tour(points, course):
+    if course["validationType"] == "outer-loop":
+        return detect_by_outer_loop(points, course)
     if course["validationType"] == "waypoints":
         return detect_by_waypoints(points, course)
     best = detect_best_tour(points, {"center": course["centroid"], "bbox": course["boundingBox"]})
     if not best:
         return {"valid": False, "bestTour": None, "allTours": []}
-    best["vmaxKnots"] = compute_vmax_knots(best["points"], 0, len(best["points"]) - 1)
+    vm = compute_vmax_detailed(best["points"], 0, len(best["points"]) - 1)
+    best["vmaxKnots"] = vm["vmaxKnots"]
+    best["vmaxSource"] = vm["source"]
+    best["vmaxSuspect"] = is_vmax_suspect(vm["vmaxKnots"], best["avgSpeedKnots"])
     best["sectors"] = build_winding_sectors(course, best["points"])
+    for p in best["points"]:
+        p.pop("speedRaw", None)  # allège la polyligne renvoyée
     return {"valid": True, "bestTour": best, "allTours": [best]}
 
 
@@ -459,7 +764,78 @@ def make_linear_speed_track(segments, start_ms=1_700_000_000_000, lat=47.60, lon
     return pts
 
 
+def with_doppler(track, speed_mps):
+    """Attache une vitesse MESURÉE (Doppler) à chaque point d'une trace."""
+    return [dict(p, speedRaw=speed_mps) for p in track]
+
+
 KN = 1.0 / MS_TO_KNOTS  # 1 nœud en m/s
+
+
+def make_hex_course():
+    """Parcours hexagonal synthétique : 6 balises = sommets de P (sens horaire)."""
+    center = {"lat": 47.6, "lon": -2.85}
+    R = 0.02  # ~2,2 km de rayon
+    cos_lat = math.cos(center["lat"] * DEG_TO_RAD)
+    verts = []
+    for k in range(6):
+        ang = (90 - k * 60) * DEG_TO_RAD  # sommets listés en sens horaire
+        verts.append({
+            "lat": center["lat"] + R * math.sin(ang),
+            "lon": center["lon"] + (R * math.cos(ang)) / cos_lat,
+        })
+    return {
+        "center": center, "cosLat": cos_lat,
+        "validationType": "outer-loop", "centroid": center,
+        "boundingBox": {"minLat": 47.4, "maxLat": 47.8, "minLon": -3.1, "maxLon": -2.6},
+        "waypoints": [
+            {"id": f"b{i + 1}", "name": f"b{i + 1}", "lat": v["lat"], "lon": v["lon"], "radiusMeters": 200}
+            for i, v in enumerate(verts)
+        ],
+        "sectors": [
+            {"id": "s1", "name": "Nord", "startWaypointIndex": 0, "endWaypointIndex": 1},
+            {"id": "s2", "name": "Est", "startWaypointIndex": 1, "endWaypointIndex": 3},
+            {"id": "s3", "name": "Sud", "startWaypointIndex": 3, "endWaypointIndex": 5},
+            {"id": "s4", "name": "Ouest", "startWaypointIndex": 5, "endWaypointIndex": 0},
+        ],
+    }
+
+
+def push_out(center, cos_lat, v, offset_deg):
+    """Pousse un sommet radialement vers l'EXTÉRIEUR depuis le centre."""
+    dy = v["lat"] - center["lat"]
+    dx = (v["lon"] - center["lon"]) * cos_lat
+    length = math.hypot(dx, dy) or 1.0
+    return {
+        "lat": v["lat"] + (dy / length) * offset_deg,
+        "lon": v["lon"] + ((dx / length) * offset_deg) / cos_lat,
+    }
+
+
+def sample_path(anchors, speed_mps=3.0, sample_s=3.0, start_ms=1_700_000_000_000):
+    pts = [{"lat": anchors[0]["lat"], "lon": anchors[0]["lon"], "time": start_ms}]
+    t = start_ms
+    for s in range(len(anchors) - 1):
+        a, b = anchors[s], anchors[s + 1]
+        steps = max(1, round(haversine_meters(a, b) / (speed_mps * sample_s)))
+        for i in range(1, steps + 1):
+            f = i / steps
+            t += int(sample_s * 1000)
+            pts.append({"lat": a["lat"] + (b["lat"] - a["lat"]) * f,
+                        "lon": a["lon"] + (b["lon"] - a["lon"]) * f, "time": t})
+    return pts
+
+
+def make_outer_track(course, order, cut_through_leg_at=-1):
+    """Longe les balises de 'order' par l'extérieur (approche ~110 m DEHORS de P)."""
+    center, cos_lat, wps = course["center"], course["cosLat"], course["waypoints"]
+    stops = [push_out(center, cos_lat, wps[i], 0.001) for i in order]
+    anchors = []
+    for s in range(len(stops)):
+        anchors.append(stops[s])
+        if s == cut_through_leg_at and s + 1 < len(stops):
+            anchors.append(center)  # coupe par le centre (incursion franche dans P)
+    return sample_path(anchors)
 
 
 # ============================================================================
@@ -499,49 +875,108 @@ class TestWinding(unittest.TestCase):
 
 
 class TestVmax(unittest.TestCase):
+    # --- NIVEAU 1 : Doppler ---------------------------------------------------
+    def test_doppler_prioritaire(self):
+        # Positions ~6 nds, mais Doppler mesuré = 12 nds sur TOUS les points.
+        # Vmax doit valoir le champ mesuré (12), PAS le calcul position (6).
+        track = with_doppler(make_linear_speed_track([(6 * KN, 30, 1.0)]), 12 * KN)
+        detailed = compute_vmax_detailed(track)
+        self.assertEqual(detailed["source"], "doppler")
+        self.assertAlmostEqual(detailed["vmaxKnots"], 12.0, delta=0.2)
+
+    def test_sans_vitesse_niveau2(self):
+        # Trace sans champ vitesse -> bascule en NIVEAU 2 (calcul par position).
+        track = make_linear_speed_track([(10 * KN, 20, 1.0)])
+        detailed = compute_vmax_detailed(track)
+        self.assertEqual(detailed["source"], "position")
+        self.assertAlmostEqual(detailed["vmaxKnots"], 10.0, delta=2.0)
+
+    # --- NIVEAU 2 : filtre d'accélération ------------------------------------
+    def test_saut_gps_isole_accel(self):
+        # Saut GPS isolé : 1 point décalé de ~20 m en 1 s (~38 nds apparents)
+        # au milieu d'une trace stable à 10 nds. Le filtre d'accélération
+        # rejette l'aller ET le retour -> Vmax reste ~10 nds.
+        cos_lat = math.cos(47.6 * DEG_TO_RAD)
+        m_per_deg_lon = 111320.0 * cos_lat
+        track = make_linear_speed_track([(10 * KN, 30, 1.0)])
+        i_mid = len(track) // 2
+        track[i_mid] = {**track[i_mid], "lon": track[i_mid]["lon"] + 20.0 / m_per_deg_lon}
+        vmax = compute_vmax_knots(track)
+        self.assertGreater(vmax, 8)
+        self.assertLess(vmax, 14)  # saut éliminé (pas gonflé à ~38 nds)
+
     def test_pic_isole_elimine(self):
-        # 5 nœuds réguliers, 1 Hz, pendant 20 s.
+        # Pic instantané > 90 nds (point téléporté ~1 s en avant) : rejeté.
         track = make_linear_speed_track([(5 * KN, 20, 1.0)])
-        # Injecte un artefact : un point 0.05 s après l'index 5, déjà ~1 s en avant.
         spike = dict(track[5])
         spike["time"] = track[5]["time"] + 50  # +0.05 s
         spike["lon"] = track[6]["lon"]          # position d'1 s plus loin
         track.insert(6, spike)
         track.sort(key=lambda p: p["time"])
-        vmax = compute_vmax_knots(track)
-        # La vitesse instantanée du pic dépasse 90 nœuds ; la fenêtre 2 s la gomme.
-        self.assertLess(vmax, 8)
+        self.assertLess(compute_vmax_knots(track), 8)
 
     def test_pic_2s_conserve(self):
-        # 5 nœuds, puis rafale 20 nœuds tenue 3 s, puis 5 nœuds.
+        # Rafale RÉELLE de 20 nds tenue 3 s : doit être conservée (≠ artefact).
         track = make_linear_speed_track([(5 * KN, 10, 1.0), (20 * KN, 3, 0.5), (5 * KN, 10, 1.0)])
         vmax = compute_vmax_knots(track)
         self.assertGreater(vmax, 18)
         self.assertLess(vmax, 22)
 
-    def test_saut_gps_rejete(self):
-        # Bug réel rapporté : un point qui "téléporte" à 300 m puis revient
-        # gonfle la Vmax. Le rejet d'outliers doit l'écarter.
+    def test_saut_300m_rejete(self):
+        # Téléportation de ~300 m (~583 nds) : rejetée (accel + garde-fou).
         track = make_linear_speed_track([(5 * KN, 20, 1.0)])
         teleport = dict(track[10])
-        teleport["lon"] = track[10]["lon"] + 0.004  # ~300 m de côté en 1 s
+        teleport["lon"] = track[10]["lon"] + 0.004  # ~300 m de côté
         track.insert(11, teleport)
         track.sort(key=lambda p: p["time"])
+        self.assertLess(compute_vmax_knots(track), 8)
+
+    # --- NIVEAU 3 : Hampel + coupures de signal ------------------------------
+    def test_derive_multipoints_hampel(self):
+        # Dérive : 4 points consécutifs décalés de ~15 m. Le filtre
+        # d'accélération + Hampel empêchent toute Vmax gonflée.
+        track = make_linear_speed_track([(10 * KN, 40, 1.0)])
+        i0 = len(track) // 2
+        for d in range(4):
+            track[i0 + d] = {**track[i0 + d], "lat": track[i0 + d]["lat"] + 15.0 / 111320.0}
         vmax = compute_vmax_knots(track)
-        self.assertLess(vmax, 8)  # le saut est rejeté, on reste à ~5 nds
+        self.assertGreater(vmax, 8)
+        self.assertLess(vmax, 16)
 
-    def test_plafond_realiste(self):
-        # Une trace entièrement à 200 nœuds (impossible) est plafonnée/rejetée.
-        track = make_linear_speed_track([(200 * KN, 10, 1.0)])
-        self.assertLessEqual(compute_vmax_knots(track, max_knots=60), 60)
+    def test_coupure_signal(self):
+        # Coupure de 8 s puis point décalé de ~200 m (balise ressortie de l'eau).
+        # Le saut sur dt=9 s a une accélération faible (passe le filtre accel),
+        # mais rejectSignalGaps invalide la vitesse parasite.
+        cos_lat = math.cos(47.6 * DEG_TO_RAD)
+        m_per_deg_lon = 111320.0 * cos_lat
+        track = make_linear_speed_track([(10 * KN, 30, 1.0)])
+        i = len(track) // 2
+        for k in range(i, len(track)):
+            track[k] = dict(track[k], time=track[k]["time"] + 8000)  # trou de 8 s
+        track[i] = dict(track[i], lon=track[i]["lon"] + 200.0 / m_per_deg_lon)
+        vmax = compute_vmax_knots(track)
+        self.assertGreater(vmax, 8)
+        self.assertLess(vmax, 14)  # parasite (~44 nds) invalidé
 
-    def test_blip_1s_attenue(self):
-        # Un pic de 40 nœuds tenu 1 s est un déplacement réel, mais la fenêtre
-        # glissante de 2 s l'atténue nettement sous sa valeur instantanée (40 nds).
+    # --- Garde-fou & cohérence -----------------------------------------------
+    def test_garde_fou_physique(self):
+        # Plus de plafond "loisir" à 40 nds : 35 nds soutenus sont CONSERVÉS...
+        fast = make_linear_speed_track([(35 * KN, 20, 1.0)])
+        self.assertGreater(compute_vmax_knots(fast), 30)
+        # ...mais le garde-fou physique absolu (50 nds) rejette l'impossible (60 nds).
+        impossible = make_linear_speed_track([(60 * KN, 20, 1.0)])
+        self.assertEqual(compute_vmax_knots(impossible), 0.0)
+
+    def test_blip_1s_supprime(self):
+        # Pic isolé de 40 nds tenu 1 s (5->40->5 ≈ 36 m/s², impossible) :
+        # le filtre d'accélération l'élimine (avant : seulement "atténué").
         track = make_linear_speed_track([(5 * KN, 8, 1.0), (40 * KN, 1, 1.0), (5 * KN, 8, 1.0)])
-        vmax = compute_vmax_knots(track)
-        self.assertLess(vmax, 30)   # atténué : bien en dessous des 40 nds instantanés
-        self.assertGreater(vmax, 15)  # mais pas totalement effacé (mouvement réel)
+        self.assertLess(compute_vmax_knots(track), 10)
+
+    def test_vmax_suspecte_flag(self):
+        # Sanity check : Vmax très au-dessus de la vmoy -> drapeau suspect.
+        self.assertTrue(is_vmax_suspect(40.0, 10.0))
+        self.assertFalse(is_vmax_suspect(22.0, 14.0))
 
 
 class TestWaypoints(unittest.TestCase):
@@ -606,6 +1041,42 @@ class TestSecteurs(unittest.TestCase):
         res = detect_by_waypoints(track, SQUARE_COURSE)
         self.assertFalse(res["valid"])
         self.assertIsNone(res["bestTour"])
+
+
+class TestOuterLoop(unittest.TestCase):
+    """Tour par l'extérieur (Tour du Golfe) — detect_by_outer_loop."""
+
+    def setUp(self):
+        self.course = make_hex_course()
+
+    def test_tour_complet_1_6_cw(self):
+        res = detect_by_outer_loop(make_outer_track(self.course, [0, 1, 2, 3, 4, 5]), self.course)
+        self.assertTrue(res["valid"])
+        self.assertEqual(res["bestTour"]["direction"], "cw")
+        self.assertGreater(res["bestTour"]["durationSeconds"], 180)
+
+    def test_tour_complet_6_1_ccw(self):
+        res = detect_by_outer_loop(make_outer_track(self.course, [5, 4, 3, 2, 1, 0]), self.course)
+        self.assertTrue(res["valid"])
+        self.assertEqual(res["bestTour"]["direction"], "ccw")
+
+    def test_depart_milieu_cyclique(self):
+        res = detect_by_outer_loop(make_outer_track(self.course, [2, 3, 4, 5, 0, 1]), self.course)
+        self.assertTrue(res["valid"])
+        self.assertEqual(res["bestTour"]["direction"], "cw")
+
+    def test_coupe_a_travers_rejete(self):
+        res = detect_by_outer_loop(
+            make_outer_track(self.course, [0, 1, 2, 3, 4, 5], cut_through_leg_at=1), self.course)
+        self.assertFalse(res["valid"])
+
+    def test_balise_manquee_rejete(self):
+        res = detect_by_outer_loop(make_outer_track(self.course, [0, 1, 2, 3, 4]), self.course)
+        self.assertFalse(res["valid"])
+
+    def test_desordre_rejete(self):
+        res = detect_by_outer_loop(make_outer_track(self.course, [0, 2, 1, 3, 4, 5]), self.course)
+        self.assertFalse(res["valid"])
 
 
 if __name__ == "__main__":

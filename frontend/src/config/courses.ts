@@ -3,7 +3,7 @@
 // Garder synchronisé avec le backend. Les coordonnées viennent d'OpenStreetMap.
 // ============================================================================
 
-export type ValidationType = 'winding' | 'waypoints';
+export type ValidationType = 'winding' | 'waypoints' | 'outer-loop';
 
 export interface Waypoint {
   id: string;
@@ -96,29 +96,26 @@ const TOUR_DU_GOLFE: Course = {
   id: 'tour-du-golfe',
   name: 'Tour du Golfe du Morbihan',
   description:
-    "La grande boucle du Golfe du Morbihan à la voile : 8 points de passage de Vannes à l'entrée du Golfe et retour.",
-  validationType: 'waypoints',
-  centroid: { lat: 47.585, lon: -2.86 },
+    "La grande boucle du Golfe du Morbihan à la voile : longer les 6 balises par l'EXTÉRIEUR, dans l'ordre, dans le sens et au départ de son choix.",
+  validationType: 'outer-loop',
+  centroid: { lat: 47.5857, lon: -2.8321 },
   boundingBox: { minLat: 47.4, maxLat: 47.8, minLon: -3.1, maxLon: -2.5 },
   categories: ALL_CATEGORIES,
+  // 6 balises dans l'ordre = sommets du polygone P (sens horaire).
   waypoints: [
-    { id: 'conleau', name: 'Conleau (Vannes)', lat: 47.6366421, lon: -2.7753428, radiusMeters: 300 },
-    { id: 'boedic', name: 'Île de Boëdic', lat: 47.6156934, lon: -2.78239, radiusMeters: 300 },
-    { id: 'belure', name: "Pointe du Béluré (Île d'Arz)", lat: 47.6060993, lon: -2.79321, radiusMeters: 300 },
-    { id: 'port-navalo', name: 'Port-Navalo (Arzon)', lat: 47.5460954, lon: -2.9142298, radiusMeters: 300 },
-    { id: 'kerpenhir', name: 'Pointe de Kerpenhir (Locmariaquer)', lat: 47.5592287, lon: -2.9342898, radiusMeters: 300 },
-    { id: 'gavrinis', name: 'Gavrinis (Larmor-Baden)', lat: 47.5741775, lon: -2.8974787, radiusMeters: 300 },
-    { id: 'larmor-baden', name: 'Larmor-Baden', lat: 47.5865525, lon: -2.8947121, radiusMeters: 300 },
     { id: 'trech', name: "Pointe du Trec'h (Île-aux-Moines)", lat: 47.6076482, lon: -2.8385098, radiusMeters: 300 },
+    { id: 'belure', name: "Pointe du Béluré (Île d'Arz)", lat: 47.6060993, lon: -2.79321, radiusMeters: 300 },
+    { id: 'nenezic', name: "Pointe de Nénézic (Île d'Arz)", lat: 47.5948654, lon: -2.7743205, radiusMeters: 300 },
+    { id: 'liouse', name: "Pointe de Liouse (Île d'Arz)", lat: 47.5784149, lon: -2.8098707, radiusMeters: 300 },
+    { id: 'nioul', name: 'Pointe de Nioul (Île-aux-Moines)', lat: 47.5646531, lon: -2.859824, radiusMeters: 300 },
+    { id: 'balise6', name: 'Balise 6 — entrée ouest du Golfe', lat: 47.5627910, lon: -2.9166475, radiusMeters: 300 },
   ],
+  // 4 façades (Option A) : Nord=arête 0-1 · Est=1-2-3 · Sud=3-4-5 · Ouest=5-0.
   sectors: [
-    { id: 's1', name: 'Conleau → Boëdic', startWaypointIndex: 0, endWaypointIndex: 1 },
-    { id: 's2', name: 'Boëdic → Béluré', startWaypointIndex: 1, endWaypointIndex: 2 },
-    { id: 's3', name: 'Béluré → Port-Navalo', startWaypointIndex: 2, endWaypointIndex: 3 },
-    { id: 's4', name: 'Port-Navalo → Kerpenhir', startWaypointIndex: 3, endWaypointIndex: 4 },
-    { id: 's5', name: 'Kerpenhir → Gavrinis', startWaypointIndex: 4, endWaypointIndex: 5 },
-    { id: 's6', name: 'Gavrinis → Larmor-Baden', startWaypointIndex: 5, endWaypointIndex: 6 },
-    { id: 's7', name: "Larmor-Baden → Trec'h", startWaypointIndex: 6, endWaypointIndex: 7 },
+    { id: 's1', name: "Façade Nord (Trec'h → Béluré)", startWaypointIndex: 0, endWaypointIndex: 1 },
+    { id: 's2', name: 'Façade Est (Béluré → Nénézic → Liouse)', startWaypointIndex: 1, endWaypointIndex: 3 },
+    { id: 's3', name: 'Façade Sud (Liouse → Nioul → Balise 6)', startWaypointIndex: 3, endWaypointIndex: 5 },
+    { id: 's4', name: "Façade Ouest (Balise 6 → Trec'h)", startWaypointIndex: 5, endWaypointIndex: 0 },
   ],
 };
 

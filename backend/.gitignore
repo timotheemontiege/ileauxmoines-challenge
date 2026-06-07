@@ -4,3 +4,5 @@ node_modules/
 *.log
 coverage/
 dist/
+.gpx-scratch/
+__pycache__/
