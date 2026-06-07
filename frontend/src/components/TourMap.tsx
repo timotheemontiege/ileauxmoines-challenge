@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, Fragment } from 'react';
 import {
   MapContainer,
   TileLayer,
@@ -126,19 +126,33 @@ export default function TourMap({
             />
           ))}
 
-        {traces.map((trace) =>
-          // Coupe la polyligne aux trous GPS : on ne relie pas les deux bords
-          // d'une coupure de signal par une droite (qui passerait sur la terre).
-          splitAtGaps(trace.positions).map((segment, i) => (
-            <Polyline
-              key={`${trace.id}#${i}`}
-              positions={segment}
-              pathOptions={{ color: trace.color, weight: 3, opacity: 0.85 }}
-            >
-              {trace.label && <Tooltip sticky>{trace.label}</Tooltip>}
-            </Polyline>
-          )),
-        )}
+        {traces.map((trace) => {
+          // Découpe aux trous GPS : trace réelle en trait plein, et le passage
+          // de chaque coupure (corde entre 2 segments) en POINTILLÉ NOIR.
+          const segments = splitAtGaps(trace.positions);
+          return (
+            <Fragment key={trace.id}>
+              {segments.map((segment, i) => (
+                <Polyline
+                  key={`seg-${i}`}
+                  positions={segment}
+                  pathOptions={{ color: trace.color, weight: 3, opacity: 0.85 }}
+                >
+                  {trace.label && <Tooltip sticky>{trace.label}</Tooltip>}
+                </Polyline>
+              ))}
+              {segments.slice(1).map((segment, i) => (
+                <Polyline
+                  key={`gap-${i}`}
+                  positions={[segments[i][segments[i].length - 1], segment[0]]}
+                  pathOptions={{ color: '#111827', weight: 2, opacity: 0.7, dashArray: '3 7' }}
+                >
+                  <Tooltip sticky>Coupure GPS</Tooltip>
+                </Polyline>
+              ))}
+            </Fragment>
+          );
+        })}
 
         <FitBounds traces={traces} waypoints={waypoints} fit={fit} />
       </MapContainer>
