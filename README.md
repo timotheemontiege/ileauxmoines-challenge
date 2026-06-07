@@ -199,10 +199,11 @@ ou anti-horaire), **départ libre** :
 4. **sans couper** `P` : aucune incursion franche (`> 250 m` de profondeur, hors
    rayon d'une balise) entre deux approches.
 
-Le chrono court du **premier passage** à la **sixième balise** ; la **boucle la
-plus rapide** est retenue ; un champ `direction` (`cw`/`ccw`) est renvoyé. Les
-**4 façades** (Nord/Est/Sud/Ouest) regroupent les 6 arêtes inter-balises (cf.
-`courses.js`).
+Le tour est un **circuit fermé** : on chronomètre de la **balise de départ**
+jusqu'à son **retour**, après avoir longé les 6 balises. Les 6 arêtes étant
+parcourues, les **4 façades** (Nord/Est/Sud/Ouest, regroupant les arêtes
+inter-balises — cf. `courses.js`) sont **toutes mesurées**. La **boucle la plus
+rapide** est retenue ; un champ `direction` (`cw`/`ccw`) est renvoyé.
 
 ### Tests
 

@@ -550,13 +550,18 @@ def build_balise_visits(pts, balises, polygon):
     return out
 
 
-def cyclic_direction(seq, n, clockwise_polygon):
-    if len(seq) != n or len(set(seq)) != n:
+def closed_loop_direction(seq, n, clockwise_polygon):
+    """Tour FERMÉ : n+1 balises, pas constant +1/-1 (mod n), retour au départ."""
+    if len(seq) != n + 1:
         return None
+    if seq[0] != seq[n]:
+        return None  # doit revenir à la balise de départ
+    if len(set(seq[:n])) != n:
+        return None  # couvre les n balises
     step = ((seq[1] - seq[0]) % n + n) % n
     if step != 1 and step != n - 1:
         return None
-    for k in range(1, n):
+    for k in range(1, n + 1):
         if ((seq[k] - seq[k - 1]) % n + n) % n != step:
             return None
     if step == 1:
@@ -630,13 +635,14 @@ def detect_by_outer_loop(points, course, opts=None):
     depth = o.get("incursionDepthMeters", OUTER_LOOP_INCURSION_DEPTH_METERS)
 
     visits = build_balise_visits(pts, balises, polygon)
-    if len(visits) < n:
+    if len(visits) < n + 1:
         return {"valid": False, "bestTour": None, "allTours": []}
 
     best = None
-    for s in range(0, len(visits) - n + 1):
-        window = visits[s:s + n]
-        direction = cyclic_direction([v["balise"] for v in window], n, clockwise)  # (B)
+    # Fenêtre glissante de n+1 visites = un TOUR FERMÉ (retour à la balise de départ).
+    for s in range(0, len(visits) - n):
+        window = visits[s:s + n + 1]
+        direction = closed_loop_direction([v["balise"] for v in window], n, clockwise)  # (B)
         if not direction:
             continue
         if not all(v["outside"] for v in window):  # (C)
@@ -644,7 +650,7 @@ def detect_by_outer_loop(points, course, opts=None):
         if has_deep_incursion(pts, window, polygon, balises, depth):  # (D)
             continue
         start_index = window[0]["index"]
-        end_index = window[n - 1]["index"]
+        end_index = window[n]["index"]  # retour à la balise de départ
         if end_index <= start_index:
             continue
         duration = (pts[end_index]["time"] - pts[start_index]["time"]) / 1000.0
@@ -1050,24 +1056,27 @@ class TestOuterLoop(unittest.TestCase):
         self.course = make_hex_course()
 
     def test_tour_complet_1_6_cw(self):
-        res = detect_by_outer_loop(make_outer_track(self.course, [0, 1, 2, 3, 4, 5]), self.course)
+        res = detect_by_outer_loop(make_outer_track(self.course, [0, 1, 2, 3, 4, 5, 0]), self.course)
         self.assertTrue(res["valid"])
         self.assertEqual(res["bestTour"]["direction"], "cw")
         self.assertGreater(res["bestTour"]["durationSeconds"], 180)
+        # Boucle fermée : les 4 façades sont TOUTES mesurées.
+        self.assertTrue(all(s["durationSeconds"] is not None for s in res["bestTour"]["sectors"]))
 
     def test_tour_complet_6_1_ccw(self):
-        res = detect_by_outer_loop(make_outer_track(self.course, [5, 4, 3, 2, 1, 0]), self.course)
+        res = detect_by_outer_loop(make_outer_track(self.course, [5, 4, 3, 2, 1, 0, 5]), self.course)
         self.assertTrue(res["valid"])
         self.assertEqual(res["bestTour"]["direction"], "ccw")
+        self.assertTrue(all(s["durationSeconds"] is not None for s in res["bestTour"]["sectors"]))
 
     def test_depart_milieu_cyclique(self):
-        res = detect_by_outer_loop(make_outer_track(self.course, [2, 3, 4, 5, 0, 1]), self.course)
+        res = detect_by_outer_loop(make_outer_track(self.course, [2, 3, 4, 5, 0, 1, 2]), self.course)
         self.assertTrue(res["valid"])
         self.assertEqual(res["bestTour"]["direction"], "cw")
 
     def test_coupe_a_travers_rejete(self):
         res = detect_by_outer_loop(
-            make_outer_track(self.course, [0, 1, 2, 3, 4, 5], cut_through_leg_at=1), self.course)
+            make_outer_track(self.course, [0, 1, 2, 3, 4, 5, 0], cut_through_leg_at=1), self.course)
         self.assertFalse(res["valid"])
 
     def test_balise_manquee_rejete(self):
@@ -1075,7 +1084,7 @@ class TestOuterLoop(unittest.TestCase):
         self.assertFalse(res["valid"])
 
     def test_desordre_rejete(self):
-        res = detect_by_outer_loop(make_outer_track(self.course, [0, 2, 1, 3, 4, 5]), self.course)
+        res = detect_by_outer_loop(make_outer_track(self.course, [0, 2, 1, 3, 4, 5, 0]), self.course)
         self.assertFalse(res["valid"])
 
 

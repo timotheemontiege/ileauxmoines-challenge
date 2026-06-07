@@ -343,29 +343,32 @@ function makeOuterTrack(course, order, { cutThroughLegAt = -1 } = {}) {
 describe('tourDetector — tour par l’extérieur (Tour du Golfe)', () => {
   const course = makeHexCourse();
 
-  it('valide un tour extérieur complet dans le sens 1→6 (cw)', () => {
-    const res = detectByOuterLoop(makeOuterTrack(course, [0, 1, 2, 3, 4, 5]), course);
+  it('valide un tour extérieur complet (fermé) dans le sens 1→6 (cw)', () => {
+    const res = detectByOuterLoop(makeOuterTrack(course, [0, 1, 2, 3, 4, 5, 0]), course);
     expect(res.valid).toBe(true);
     expect(res.bestTour.direction).toBe('cw');
     expect(res.bestTour.durationSeconds).toBeGreaterThan(180);
     expect(res.bestTour.points.length).toBeGreaterThan(50);
+    // Boucle fermée : les 4 façades sont TOUTES mesurées.
+    expect(res.bestTour.sectors.every((s) => s.durationSeconds != null)).toBe(true);
   });
 
   it('valide le même tour dans le sens 6→1 (ccw)', () => {
-    const res = detectByOuterLoop(makeOuterTrack(course, [5, 4, 3, 2, 1, 0]), course);
+    const res = detectByOuterLoop(makeOuterTrack(course, [5, 4, 3, 2, 1, 0, 5]), course);
     expect(res.valid).toBe(true);
     expect(res.bestTour.direction).toBe('ccw');
+    expect(res.bestTour.sectors.every((s) => s.durationSeconds != null)).toBe(true);
   });
 
   it('valide un départ depuis une balise du milieu (ordre cyclique)', () => {
-    const res = detectByOuterLoop(makeOuterTrack(course, [2, 3, 4, 5, 0, 1]), course);
+    const res = detectByOuterLoop(makeOuterTrack(course, [2, 3, 4, 5, 0, 1, 2]), course);
     expect(res.valid).toBe(true);
     expect(res.bestTour.direction).toBe('cw');
   });
 
   it('rejette une trace qui coupe à travers le polygone', () => {
     const res = detectByOuterLoop(
-      makeOuterTrack(course, [0, 1, 2, 3, 4, 5], { cutThroughLegAt: 1 }),
+      makeOuterTrack(course, [0, 1, 2, 3, 4, 5, 0], { cutThroughLegAt: 1 }),
       course,
     );
     expect(res.valid).toBe(false);
@@ -377,7 +380,7 @@ describe('tourDetector — tour par l’extérieur (Tour du Golfe)', () => {
   });
 
   it('rejette des balises approchées dans le désordre', () => {
-    const res = detectByOuterLoop(makeOuterTrack(course, [0, 2, 1, 3, 4, 5]), course);
+    const res = detectByOuterLoop(makeOuterTrack(course, [0, 2, 1, 3, 4, 5, 0]), course);
     expect(res.valid).toBe(false);
   });
 });

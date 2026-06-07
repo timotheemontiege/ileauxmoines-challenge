@@ -582,16 +582,18 @@ function buildBaliseVisits(pts, balises, polygon) {
 }
 
 /**
- * Si la suite d'indices de balises est un ordre cyclique cohérent (pas constant
- * de +1 ou -1 modulo N, N balises distinctes), retourne le sens ; sinon null.
- * Le sens (cw|ccw) tient compte de l'orientation réelle du polygone.
+ * Si la suite de N+1 indices de balises est un TOUR FERMÉ cohérent — pas constant
+ * de +1 ou -1 (mod N) sur les N legs, N balises distinctes, ET retour à la balise
+ * de départ (seq[0] === seq[N]) — retourne le sens ; sinon null. Le sens (cw|ccw)
+ * tient compte de l'orientation réelle du polygone.
  */
-function cyclicDirection(baliseSeq, N, clockwisePolygon) {
-  if (baliseSeq.length !== N) return null;
-  if (new Set(baliseSeq).size !== N) return null; // doit couvrir les N balises
+function closedLoopDirection(baliseSeq, N, clockwisePolygon) {
+  if (baliseSeq.length !== N + 1) return null;
+  if (baliseSeq[0] !== baliseSeq[N]) return null; // doit revenir à la balise de départ
+  if (new Set(baliseSeq.slice(0, N)).size !== N) return null; // couvre les N balises
   const step = (((baliseSeq[1] - baliseSeq[0]) % N) + N) % N;
   if (step !== 1 && step !== N - 1) return null;
-  for (let k = 1; k < N; k++) {
+  for (let k = 1; k <= N; k++) {
     const d = (((baliseSeq[k] - baliseSeq[k - 1]) % N) + N) % N;
     if (d !== step) return null;
   }
@@ -671,8 +673,10 @@ function buildOuterLoopSectors(courseConfig, window, N) {
  * Détection « tour par l'extérieur » (Tour du Golfe).
  * Valide si les N balises sont approchées (A) dans l'ordre cyclique d'un sens
  * cohérent, départ libre (B), chaque approche DEHORS de P (C), sans incursion
- * franche dans P entre 2 approches (D). Fenêtre = 1ʳᵉ → Nᵉ balise ; si plusieurs
- * boucles valides, on garde la plus rapide.
+ * franche dans P entre 2 approches (D). Fenêtre = TOUR FERMÉ : de la balise de
+ * départ jusqu'à son retour après avoir longé les N-1 autres (N+1 approches, N
+ * arêtes -> les 4 façades sont toujours mesurées). Si plusieurs boucles valides,
+ * on garde la plus rapide.
  */
 export function detectByOuterLoop(points, courseConfig, options = {}) {
   const opts = { ...DEFAULT_DETECTION_OPTIONS, ...options };
@@ -690,19 +694,19 @@ export function detectByOuterLoop(points, courseConfig, options = {}) {
   const depth = opts.incursionDepthMeters ?? OUTER_LOOP_INCURSION_DEPTH_METERS;
 
   const visits = buildBaliseVisits(pts, balises, polygon);
-  if (visits.length < N) return { valid: false, bestTour: null, allTours: [] };
+  if (visits.length < N + 1) return { valid: false, bestTour: null, allTours: [] };
 
   let best = null;
-  // Fenêtre glissante de N visites consécutives (départ libre).
-  for (let s = 0; s + N <= visits.length; s++) {
-    const window = visits.slice(s, s + N);
-    const direction = cyclicDirection(window.map((v) => v.balise), N, clockwise); // (B)
+  // Fenêtre glissante de N+1 visites = un TOUR FERMÉ (retour à la balise de départ).
+  for (let s = 0; s + N + 1 <= visits.length; s++) {
+    const window = visits.slice(s, s + N + 1);
+    const direction = closedLoopDirection(window.map((v) => v.balise), N, clockwise); // (B)
     if (!direction) continue;
     if (!window.every((v) => v.outside)) continue; // (C)
     if (hasDeepIncursion(pts, window, polygon, balises, depth)) continue; // (D)
 
     const startIndex = window[0].index;
-    const endIndex = window[N - 1].index;
+    const endIndex = window[N].index; // retour à la balise de départ
     if (endIndex <= startIndex) continue;
 
     const durationSeconds = (pts[endIndex].time - pts[startIndex].time) / 1000;
