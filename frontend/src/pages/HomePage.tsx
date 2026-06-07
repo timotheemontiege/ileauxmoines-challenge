@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { getLeaderboard, getLeaderboardTraces } from '../lib/api';
-import { traceToPositions, downsampleUniform } from '../lib/trace';
+import { traceToPositions, downsampleUniform, closeLoop } from '../lib/trace';
 import type { LeaderboardEntry, TraceRecord } from '../types';
 import { categoryColor } from '../lib/categories';
 import { formatDuration } from '../lib/format';
@@ -56,10 +56,10 @@ export default function HomePage() {
       traces
         .map((t) => ({
           id: t.performance_id,
-          // Trace COMPLÈTE (même source que la page détail), décimée UNIFORMÉMENT
-          // si besoin pour alléger la carte — jamais tronquée. Cap large (no-op
-          // tant que le stockage borne déjà à ~500 pts via downsampleTrace).
-          positions: downsampleUniform(traceToPositions(t.gpx_tour_points), 1000),
+          // Trace COMPLÈTE (même source que la page détail), boucle FERMÉE (comme
+          // le détail) et décimée UNIFORMÉMENT si besoin — jamais tronquée. Cap
+          // large (no-op tant que le stockage borne déjà à ~500 pts).
+          positions: closeLoop(downsampleUniform(traceToPositions(t.gpx_tour_points), 1000)),
           color: categoryColor(t.category),
           label: `${t.username} · ${formatDuration(t.duration_seconds)}`,
         }))

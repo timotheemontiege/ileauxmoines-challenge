@@ -27,6 +27,21 @@ function distanceMeters(a: LatLngTuple, b: LatLngTuple): number {
 }
 
 /**
+ * Ferme la boucle : ajoute le 1er point à la fin si la trace ne s'y referme pas
+ * déjà. La carte d'accueil affiche ainsi le tour FERMÉ — comme la page détail,
+ * qui referme la boucle via son secteur de bouclage — au lieu d'une polyligne
+ * OUVERTE laissant un « trou » à la jointure départ/arrivée. (splitAtGaps gère
+ * ensuite le cas où cette fermeture serait en réalité une vraie coupure GPS.)
+ */
+export function closeLoop(positions: LatLngTuple[]): LatLngTuple[] {
+  if (positions.length < 3) return positions;
+  const first = positions[0];
+  const last = positions[positions.length - 1];
+  if (first[0] === last[0] && first[1] === last[1]) return positions;
+  return [...positions, first];
+}
+
+/**
  * Coupe une polyligne en sous-segments continus là où deux points consécutifs
  * sont distants de plus de `maxGapMeters` (= coupure de signal GPS). Évite de
  * tracer une droite par-dessus la terre/l'île entre les deux bords d'un trou GPS.
