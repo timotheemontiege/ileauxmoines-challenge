@@ -11,6 +11,7 @@ import Filters from '../components/Filters';
 import LeaderboardTable from '../components/LeaderboardTable';
 import TourMap, { type MapTrace, type MapWaypoint } from '../components/TourMap';
 import Spinner from '../components/Spinner';
+import ExportHelpModal from '../components/ExportHelpModal';
 
 export default function HomePage() {
   const { course, courseId } = useCourse();
@@ -19,6 +20,7 @@ export default function HomePage() {
   const [traces, setTraces] = useState<TraceRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [showExport, setShowExport] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -101,6 +103,13 @@ export default function HomePage() {
             <Link to="/leaderboard" className="btn-ghost">
               Voir le classement
             </Link>
+            <button
+              type="button"
+              onClick={() => setShowExport(true)}
+              className="btn-ghost"
+            >
+              Comment exporter en GPX ?
+            </button>
           </div>
         </div>
       </section>
@@ -181,6 +190,8 @@ export default function HomePage() {
           </section>
         </>
       )}
+
+      <ExportHelpModal open={showExport} onClose={() => setShowExport(false)} />
     </div>
   );
 }
